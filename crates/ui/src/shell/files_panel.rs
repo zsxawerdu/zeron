@@ -1,4 +1,4 @@
-//! Session-owned explorer chrome, independent of the surface tab host.
+//! Workspace-owned explorer chrome, independent of the surface tab host.
 
 use super::*;
 use crate::settings::{FILES_PANEL_MAX, FILES_PANEL_MIN};
@@ -72,7 +72,7 @@ fn files_panel_layout(
 impl Shell {
     pub(super) fn files_panel_open(&self, cx: &App) -> bool {
         matches!(self.route, Route::Chat)
-            && !self.active_chat.is_empty()
+            && self.files_workspace_available(cx)
             && self.panels.get(&self.panel_key(cx)).files_open
     }
 
@@ -127,7 +127,7 @@ impl Shell {
     }
 
     pub(super) fn files_visible_width(&self, cx: &App) -> f32 {
-        if !matches!(self.route, Route::Chat) || self.active_chat.is_empty() {
+        if !matches!(self.route, Route::Chat) || !self.files_workspace_available(cx) {
             return 0.0;
         }
         if !self.horizontal_fit().files
@@ -235,13 +235,18 @@ impl Shell {
 
     pub(super) fn prune_file_explorers(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
-        if !state.chats_synced {
+        if !state.chats_synced || !state.spaces_synced {
             return;
         }
         let live = state
             .chats
             .iter()
-            .map(|chat| chat.id.as_str())
+            .map(|chat| chat.id.clone())
+            .chain(
+                state.spaces.iter().map(|space| {
+                    crate::state::canvas_panel_key(Some(&space.id))
+                }),
+            )
             .collect::<std::collections::HashSet<_>>();
         for key in self.files.keys().filter(|key| !live.contains(key.as_str())) {
             self.panels.update(key, |panels| panels.files_open = false);
@@ -263,7 +268,7 @@ impl Shell {
     }
 
     pub(super) fn add_files_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_chat.is_empty() {
+        if !self.files_workspace_available(cx) {
             return;
         }
         let key = self.panel_key(cx);
@@ -271,7 +276,7 @@ impl Shell {
             let files = cx.new(|cx| {
                 FilesSurface::new_explorer(
                     self.state.clone(),
-                    self.active_chat.clone(),
+                    key.clone(),
                     self.settings.files_show_all,
                     cx,
                 )
@@ -427,7 +432,7 @@ impl Shell {
         }
         let exiting = self.fit_exit_width(2).is_some();
         if !matches!(self.route, Route::Chat)
-            || self.active_chat.is_empty()
+            || !self.files_workspace_available(cx)
             || (!self.horizontal_fit().files && !exiting)
             || (!self.files_panel_open(cx) && !self.tween_active(self.files_tween) && !exiting)
         {
@@ -737,6 +742,6 @@ mod tests {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(any(all(test, target_os = "linux"), feature = "files-panel-fixture"))]
 #[path = "files_panel_workspace_tests.rs"]
-mod workspace_tests;
+pub(super) mod workspace_tests;

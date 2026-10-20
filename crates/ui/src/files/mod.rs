@@ -991,7 +991,7 @@ impl FilesSurface {
     pub(crate) fn is_current_target(&self, cx: &gpui::App) -> bool {
         self.request_context.is_some()
             && self.request_context
-                == FilesRequestContext::for_chat(self.state.read(cx), &self.chat_id)
+                == FilesRequestContext::for_owner(self.state.read(cx), &self.chat_id)
             && !self.target_change_pending
     }
 
@@ -1121,10 +1121,14 @@ impl FilesSurface {
     }
 
     fn sync_target(&mut self, cx: &mut Context<Self>) -> bool {
-        let next = FilesRequestContext::for_chat(self.state.read(cx), &self.chat_id);
+        let next = FilesRequestContext::for_owner(self.state.read(cx), &self.chat_id);
         if self.request_context == next {
             self.target_change_pending = false;
             self.pending_request_context = None;
+            if next.is_none() && self.error.is_none() {
+                self.error = Some("No workspace available for these files.".into());
+                cx.notify();
+            }
             return false;
         }
         if self.preview.has_unsaved_changes() {
@@ -1191,7 +1195,7 @@ impl FilesSurface {
         self.reset_search_results();
         self.sync_tree_list();
         self.error = if next.is_none() {
-            Some("No workspace available for this chat.".into())
+            Some("No workspace available for these files.".into())
         } else {
             None
         };

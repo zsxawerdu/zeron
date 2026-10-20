@@ -138,13 +138,10 @@ impl<T: Default> WorkspaceQuery<T> {
     }
 }
 
-/// The focused chat's workspace connection, when it has one.
+/// The focused chat's checkout, or the selected project's root before a chat.
 fn palette_workspace(shell: &Shell, cx: &App) -> Option<WorkspaceFilesClient> {
-    if shell.active_chat.is_empty() {
-        return None;
-    }
     let state = shell.state.read(cx);
-    let context = FilesRequestContext::for_chat(state, &shell.active_chat)?;
+    let context = FilesRequestContext::for_owner(state, &shell.panel_key(cx))?;
     Some(WorkspaceFilesClient::new(state.engine()?.clone(), context))
 }
 
@@ -668,7 +665,8 @@ impl Shell {
         // files (the host's empty-query list), each path once.
         let recent_files = |limit| {
             let mut seen = std::collections::HashSet::new();
-            let opened = self.recent_files(&self.active_chat).map(|path| (path.clone(), false));
+            let owner = self.panel_key(cx);
+            let opened = self.recent_files(&owner).map(|path| (path.clone(), false));
             let changed = palette
                 .files
                 .results
@@ -884,7 +882,7 @@ impl Shell {
         }
     }
 
-    /// Open a workspace path of the focused chat: a file in an editor tab
+    /// Open a workspace path of the focused chat or selected project: a file in an editor tab
     /// (at `location`, when given), a folder revealed in the files tree.
     fn open_palette_path(
         &mut self,
@@ -894,7 +892,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.active_chat.is_empty() {
+        if !self.files_workspace_available(cx) {
             return;
         }
         if is_dir {
@@ -911,7 +909,7 @@ impl Shell {
         if !was_open {
             self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         }
-        let owner = (self.active_chat.clone(), self.state.clone());
+        let owner = (self.panel_key(cx), self.state.clone());
         self.add_file_surface_at(owner, path, location, window, cx);
     }
 

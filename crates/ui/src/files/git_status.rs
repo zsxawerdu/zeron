@@ -264,7 +264,7 @@ impl GitStatusSource {
 }
 
 impl FilesSurface {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "files-panel-fixture"))]
     pub(crate) fn test_git_source(&self) -> Option<gpui::EntityId> {
         self.git_status.as_ref().map(Entity::entity_id)
     }
@@ -272,7 +272,7 @@ impl FilesSurface {
         self.git_status.as_ref()?.read(cx).notice
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "files-panel-fixture"))]
     pub(crate) fn test_git_color(
         &self,
         path: &str,
@@ -303,10 +303,16 @@ impl FilesSurface {
             }
             return;
         };
-        let Some(chat) = state.chats.iter().find(|chat| chat.id == self.chat_id) else {
-            return;
+        let project = if let Some(space_id) = context.target.space_id.as_deref() {
+            state.space_row(space_id).map(|space| (&space.id, &space.device_id))
+        } else {
+            state
+                .chats
+                .iter()
+                .find(|chat| chat.id == self.chat_id)
+                .and_then(|chat| chat.space_id.as_ref().map(|space| (space, &chat.device_id)))
         };
-        let Some(space) = &chat.space_id else {
+        let Some((space, device)) = project else {
             let had_source = self.git_status.is_some();
             self.release_git_status();
             if had_source {
@@ -314,7 +320,7 @@ impl FilesSurface {
             }
             return;
         };
-        let device = chat.device_id.clone();
+        let device = device.clone();
         // A shared source must survive the first consuming chat disappearing.
         context.target = zeron_proto::WorkspaceTarget {
             chat_id: None,

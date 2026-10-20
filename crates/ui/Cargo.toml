@@ -17,6 +17,7 @@ windows-render-fixture = []
 appshots-fixture = ["gpui_platform/test-support"]
 pull-request-fixture = ["gpui_platform/test-support"]
 resource-profile = ["gpui/bench", "gpui_platform/test-support"]
+files-panel-fixture = ["gpui_platform/test-support", "dep:tempfile"]
 
 [[example]]
 name = "macos-resource-profile"
@@ -58,7 +59,12 @@ required-features = ["project-palette-fixture"]
 name = "compact-picker-fixture"
 required-features = ["compact-picker-fixture"]
 
+[[example]]
+name = "files-panel-fixture"
+required-features = ["files-panel-fixture"]
+
 [dependencies]
+tempfile = { workspace = true, optional = true }
 zeron-voice-media.workspace = true
 zeron-voice-session.workspace = true
 zeron-orb.workspace = true

@@ -73,6 +73,11 @@ mod chat_rename_tests;
 mod command_palette;
 mod file_mutations;
 mod files_panel;
+
+#[cfg(feature = "files-panel-fixture")]
+pub fn run_files_panel_fixture() {
+    files_panel::workspace_tests::files_panel_workspace_navigation_and_external_updates();
+}
 mod harness_updates;
 mod navigation_focus;
 #[cfg(test)]
@@ -2232,6 +2237,8 @@ pub struct Shell {
     sidebar_opened_at: u64,
     /// The panel key of the chat currently shown ("" = new-chat canvas).
     active_chat: String,
+    /// Last reconciled project canvas owner; layout also runs without an App context.
+    canvas_panel_key: Option<String>,
     /// Last selected session survives opening the blank Appshot destination.
     last_appshot_chat: Option<String>,
     /// Last rendered sidebar order (key + estimated height) — the FLIP baseline
@@ -2543,6 +2550,10 @@ impl Shell {
             _observation: cx.observe(&shell, |_, _, cx| cx.notify()),
         });
         Self {
+            canvas_panel_key: state
+                .read(cx)
+                .selected_space_row()
+                .map(|space| crate::state::canvas_panel_key(Some(&space.id))),
             state,
             sidebar_pane,
             transcript,
@@ -3177,13 +3188,25 @@ impl Shell {
         if !selected.is_empty() {
             self.last_appshot_chat = Some(selected.clone());
         }
-        if selected != self.active_chat {
+        let canvas_panel_key = state
+            .read(cx)
+            .selected_space_row()
+            .map(|space| crate::state::canvas_panel_key(Some(&space.id)));
+        if selected != self.active_chat
+            || (selected.is_empty() && canvas_panel_key != self.canvas_panel_key)
+        {
             self.suspend_file_images(cx);
-            if !self.active_chat.is_empty() {
+            let previous_key = if self.active_chat.is_empty() {
+                self.canvas_panel_key.clone()
+            } else {
+                Some(self.active_chat.clone())
+            };
+            if let Some(previous_key) = previous_key {
                 let expanded = self.right_pane_expanded;
                 self.panels
-                    .update(&self.active_chat, |panels| panels.right_expanded = expanded);
+                    .update(&previous_key, |panels| panels.right_expanded = expanded);
             }
+            self.canvas_panel_key = canvas_panel_key;
             self.active_chat = selected;
             // Route history: a chat switch is a navigation. The very first
             // selection off the untouched boot canvas REPLACES that entry —
@@ -3214,8 +3237,7 @@ impl Shell {
             } else {
                 self.panels.get(&key)
             };
-            self.right_pane_expanded =
-                !self.active_chat.is_empty() && panels.changes_open && panels.right_expanded;
+            self.right_pane_expanded = panels.changes_open && panels.right_expanded;
             if let Some(panel) = self.terminal.clone() {
                 panel.update(cx, |panel, cx| panel.set_open(panels.terminal_open, cx));
             }
@@ -3273,19 +3295,22 @@ impl Shell {
     /// (user report).
     fn panel_key(&self, cx: &App) -> String {
         if self.active_chat.is_empty() {
-            crate::state::canvas_panel_key(self.state.read(cx).selected_space.as_deref())
+            crate::state::canvas_panel_key(
+                self.state.read(cx).selected_space_row().map(|space| space.id.as_str()),
+            )
         } else {
             self.active_chat.clone()
         }
     }
 
-    /// Whether the right pane shows. NOT gated on git any more: the pane is
-    /// a surface HOST now (terminals work in any space), so only the Git
-    /// surface rows check `space_git_detected`. Still hidden on the
-    /// new-session canvas, where the titlebar carries no toggle to close it
-    /// again (an earlier user request).
+    /// Files can be addressed by a real chat or the selected project's root.
+    fn files_workspace_available(&self, cx: &App) -> bool {
+        !self.active_chat.is_empty() || self.state.read(cx).selected_space_row().is_some()
+    }
+
+    /// Surface tabs are scoped to a chat or project canvas, independently of Git.
     fn right_pane_open(&self, cx: &App) -> bool {
-        !self.active_chat.is_empty() && self.panels.get(&self.panel_key(cx)).changes_open
+        self.files_workspace_available(cx) && self.panels.get(&self.panel_key(cx)).changes_open
     }
 
     /// Open and on screen: the window fit is not hiding it.
@@ -3380,7 +3405,7 @@ impl Shell {
     /// An open pane the window fit hides is brought forward instead, so the
     /// requested content is reachable.
     fn set_surfaces_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        if self.active_chat.is_empty() {
+        if !self.files_workspace_available(cx) {
             return;
         }
         if self.right_pane_open(cx) == open {
@@ -3534,7 +3559,7 @@ impl Shell {
         let Some(origin) = &payload.origin else {
             return;
         };
-        let current = crate::files::client::FilesRequestContext::for_chat(
+        let current = crate::files::client::FilesRequestContext::for_owner(
             self.state.read(cx),
             &self.panel_key(cx),
         );
@@ -3845,6 +3870,13 @@ impl Shell {
         let Some(source) = activation.source_session.clone() else {
             return LinkOutcome::Rejected;
         };
+        // Project previews have no session browser; web links use the system browser.
+        if self.active_chat.is_empty()
+            && self.files_workspace_available(cx)
+            && source == self.panel_key(cx)
+        {
+            return activation.web_outcome(false);
+        }
         let from_main = !self.active_chat.is_empty()
             && source == self.active_chat
             && self.state.read(cx).selected_chat.as_deref() == Some(self.active_chat.as_str());
@@ -3999,9 +4031,9 @@ impl Shell {
         self.register_diff_surface(changes, window, cx);
     }
 
-    /// Open or focus a session-owned editor tab. The explorer is independent.
+    /// Open or focus an editor owned by the current chat or project canvas.
     fn add_file_surface(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        let owner = (self.active_chat.clone(), self.state.clone());
+        let owner = (self.panel_key(cx), self.state.clone());
         self.add_file_surface_at(owner, path, None, window, cx);
     }
 
@@ -4017,8 +4049,8 @@ impl Shell {
             .map(|side| (chat_id.to_owned(), side.state.clone()))
     }
 
-    /// Open or focus the editor for `path` owned by `owner` (chat id + the
-    /// state that resolves it): reads and saves go to that chat's checkout.
+    /// Open or focus the editor for `path` in its owning chat or project.
+    /// Side-chat links retain their own state and checkout.
     fn add_file_surface_at(
         &mut self,
         owner: (String, Entity<AppState>),
@@ -4027,7 +4059,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.active_chat.is_empty() || owner.0.is_empty() {
+        if !self.files_workspace_available(cx) || owner.0.is_empty() {
             return;
         }
         let (owner_chat, owner_state) = owner;
@@ -13378,7 +13410,7 @@ impl Render for Shell {
                 WorkspaceCommand::Diff if !self.active_chat.is_empty() => {
                     self.add_diff_surface(window, cx)
                 }
-                WorkspaceCommand::Files if !self.active_chat.is_empty() => {
+                WorkspaceCommand::Files if self.files_workspace_available(cx) => {
                     self.add_files_surface(window, cx)
                 }
                 WorkspaceCommand::Terminal if !self.active_chat.is_empty() => {

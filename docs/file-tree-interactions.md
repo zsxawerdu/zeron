@@ -1,5 +1,20 @@
 # File tree actions and workspace moves
 
+## Browsing before starting a chat
+
+Select a project on the new-session canvas, then use the Files button in the
+titlebar or **Cmd+E** (**Ctrl+E** on Linux/Windows). The explorer can list, search,
+preview, edit and save files without creating a chat. Without a selected project,
+select one first.
+
+Before a chat, file requests use the project's root and owning device. Explorer
+state and editor tabs belong to that project; switching projects keeps their tabs
+and unsaved text separate. Starting or selecting a chat uses that chat's workspace
+instead, including its worktree. Returning to the project's new-session canvas
+restores the project-owned panels.
+
+## Tree actions
+
 Right-click a file or folder in the explorer to open the shared context menu.
 The same menu opens with the Menu key or Shift+F10 on the selected row.
 
@@ -129,10 +144,25 @@ cargo test --release --locked -p zeron-ui --lib -- --test-threads=1
 cargo check --release --locked -p zeron
 ```
 
-This implementation was exercised on Linux with GPUI's test backend. Native
-macOS/Windows interaction, Windows junctions, and the case-insensitive-volume
-fallback require verification on those hosts. A Windows-specific regression is
-included for row-click jitter and intentional row dragging. A desktop visual
+The native project-files scenario uses an isolated engine and temporary projects:
+
+```sh
+ZERON_FILES_CAPTURES=/tmp/zeron-files-captures \
+  cargo run --locked -p zeron-ui --features files-panel-fixture --example files-panel-fixture
+```
+
+On macOS this runs on the main thread, captures the actual window, and checks
+pre-chat browsing/editing/saving, project isolation, unsaved text across project
+switches, and a real chat's separate Git worktree. Linux also runs the legacy
+external-update watcher sequence. The macOS project-files scenario was exercised
+with native screenshots; remote-owner routing has unit coverage, not a live remote
+desktop check.
+
+The original tree-mutation implementation was exercised on Linux with GPUI's test
+backend. Structural drag/rename/delete interactions on native macOS/Windows,
+Windows junctions, and the case-insensitive-volume fallback still require
+verification on those hosts. A Windows-specific regression is included for
+row-click jitter and intentional row dragging. A desktop visual
 review of themes, narrow windows and pointer feel is still required; headless
 tests do not establish native rendering quality.
 

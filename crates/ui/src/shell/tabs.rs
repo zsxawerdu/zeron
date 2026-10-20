@@ -299,7 +299,7 @@ impl Shell {
     }
 
     /// The trailing titlebar strip follows the columns beneath it.
-    pub(super) fn titlebar_trailing_layout(&self, on_canvas: bool, cx: &App) -> TitlebarTrailing {
+    pub(super) fn titlebar_trailing_layout(&self, cx: &App) -> TitlebarTrailing {
         let sidebar_now = self.sidebar_now();
         let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
 
@@ -315,12 +315,11 @@ impl Shell {
         // entity; expand + close shell-side). It lives up here because the
         // titlebar overlay owns this band's hit-testing: controls mounted in
         // the pane itself would sit under the drag region and never see a
-        // click. Closed, it is just the stable open/close toggle. Hidden on
-        // the new-session canvas (user request) — nothing to diff yet.
+        // click. Closed, it is just the stable open/close toggle.
         let fit = self.horizontal_fit();
-        let right_pane_visible = !on_canvas
-            && ((fit.right && (self.right_pane_open(cx) || self.tween_active(self.right_tween)))
-                || self.fit_exit_width(1).is_some());
+        let right_pane_visible =
+            (fit.right && (self.right_pane_open(cx) || self.tween_active(self.right_tween)))
+                || self.fit_exit_width(1).is_some();
         let takeover = right_pane_visible
             && (self.right_pane_expanded || self.tween_active(self.main_takeover_tween));
         // In takeover the title hides and the strip owns the whole band, so
@@ -421,7 +420,7 @@ impl Shell {
             right_pad,
             widths,
             content_width,
-        } = self.titlebar_trailing_layout(on_canvas, cx);
+        } = self.titlebar_trailing_layout(cx);
 
         // What runs alongside the open chat: its working subagents and side
         // chats, counted on the session card's toggle.
@@ -442,7 +441,7 @@ impl Shell {
                 state.running_subagents_for(chat, now) + side_chats
             })
         };
-        let trailing: Option<gpui::AnyElement> = if on_canvas {
+        let trailing: Option<gpui::AnyElement> = if !self.files_workspace_available(cx) {
             None
         } else {
             let mut controls = div()

@@ -24,6 +24,33 @@ pub struct FilesRequestContext {
 }
 
 impl FilesRequestContext {
+    /// Resolve a files surface owner: chat ids retain their worktree, while
+    /// canvas keys address the project encoded in the key, not the selection.
+    pub fn for_owner(state: &AppState, owner: &str) -> Option<Self> {
+        if let Some(space_id) = owner.strip_prefix(crate::state::CANVAS_PANEL_PREFIX) {
+            if space_id.is_empty() {
+                return None;
+            }
+            let space = state.space_row(space_id)?;
+            if space.path.trim().is_empty() {
+                return None;
+            }
+            return Some(Self {
+                target: WorkspaceTarget {
+                    chat_id: None,
+                    space_id: Some(space.id.clone()),
+                    checkout_path: None,
+                },
+                target_device_id: (state.local_device_id.as_deref()
+                    != Some(space.device_id.as_str()))
+                .then(|| space.device_id.clone()),
+                cwd: space.path.clone(),
+                checkout_id: space.checkout_id.clone(),
+            });
+        }
+        Self::for_chat(state, owner)
+    }
+
     pub fn for_chat(state: &AppState, chat_id: &str) -> Option<Self> {
         let chat = state.chats.iter().find(|chat| chat.id == chat_id)?;
         let cwd = chat
@@ -391,6 +418,79 @@ mod tests {
             }
             Ok(receiver)
         }
+    }
+
+    #[test]
+    fn canvas_owner_resolves_pinned_local_and_remote_projects() {
+        let mut state = AppState::new();
+        state.local_device_id = Some("local".into());
+        for (id, device, path) in [
+            ("local-project", "local", "/projects/local"),
+            ("remote-project", "remote", "/projects/remote"),
+        ] {
+            state.spaces.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": id, "deviceId": device, "path": path,
+                    "checkoutId": format!("{id}-checkout"),
+                    "createdAt": "2026-01-01T00:00:00Z"
+                }))
+                .unwrap(),
+            );
+        }
+        state.selected_space = Some("remote-project".into());
+        let local_owner = crate::state::canvas_panel_key(Some("local-project"));
+        let local = FilesRequestContext::for_owner(&state, &local_owner).unwrap();
+        assert_eq!(local.target.chat_id, None);
+        assert_eq!(local.target.space_id.as_deref(), Some("local-project"));
+        assert_eq!(local.target.checkout_path, None);
+        assert_eq!(local.target_device_id, None);
+        assert_eq!(local.cwd, "/projects/local");
+        assert_eq!(local.checkout_id.as_deref(), Some("local-project-checkout"));
+
+        let remote_owner = crate::state::canvas_panel_key(Some("remote-project"));
+        let remote = FilesRequestContext::for_owner(&state, &remote_owner).unwrap();
+        assert_eq!(remote.target.space_id.as_deref(), Some("remote-project"));
+        assert_eq!(remote.target.chat_id, None);
+        assert_eq!(remote.target_device_id.as_deref(), Some("remote"));
+        let params = request_params(
+            &ReadWorkspaceFileRequest {
+                target: remote.target.clone(),
+                path: "src/lib.rs".into(),
+            },
+            remote.target_device_id.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(params["spaceId"], "remote-project");
+        assert_eq!(params["targetDeviceId"], "remote");
+        assert!(params.get("chatId").is_none());
+        state.selected_space = Some("local-project".into());
+        assert_eq!(FilesRequestContext::for_owner(&state, &remote_owner), Some(remote));
+
+        state.spaces.retain(|space| space.id != "remote-project");
+        assert!(FilesRequestContext::for_owner(&state, &remote_owner).is_none());
+        assert!(FilesRequestContext::for_owner(&state, &crate::state::canvas_panel_key(None)).is_none());
+        state.spaces[0].path.clear();
+        assert!(FilesRequestContext::for_owner(&state, &local_owner).is_none());
+    }
+
+    #[test]
+    fn chat_owner_keeps_chat_worktree_precedence() {
+        let mut state = crate::files::test_support::state();
+        state.spaces.push(
+            serde_json::from_value(serde_json::json!({
+                "id": "project", "deviceId": "device", "path": "/projects/root",
+                "checkoutId": "root-checkout", "createdAt": "2026-01-01T00:00:00Z"
+            }))
+            .unwrap(),
+        );
+        state.chats[0].space_id = Some("project".into());
+        state.chats[0].cwd = Some("/projects/root/.worktrees/chat".into());
+        let chat = FilesRequestContext::for_owner(&state, "chat").unwrap();
+        assert_eq!(chat, FilesRequestContext::for_chat(&state, "chat").unwrap());
+        assert_eq!(chat.target.chat_id.as_deref(), Some("chat"));
+        assert_eq!(chat.target.space_id, None);
+        assert_eq!(chat.cwd, "/projects/root/.worktrees/chat");
+        assert_eq!(chat.checkout_id.as_deref(), Some("checkout"));
     }
 
     fn target() -> WorkspaceTarget {

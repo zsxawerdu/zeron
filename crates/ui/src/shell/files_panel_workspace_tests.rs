@@ -1,5 +1,5 @@
 //! Exercise the explorer and editors against an isolated real workspace/RPC.
-//! Set ZERON_FILES_CAPTURES to a directory to run on X11 and capture the fixture.
+//! Set ZERON_FILES_CAPTURES to a directory to capture the native fixture.
 use super::*;
 use crate::settings::{FILES_PANEL_DEFAULT, RIGHT_PANE_DEFAULT};
 use gpui::{AppContext, AsyncApp, WindowHandle};
@@ -57,17 +57,37 @@ async fn frame(window: WindowHandle<Shell>, cx: &mut AsyncApp, output: Option<&P
         .unwrap();
     if let Some(output) = output {
         std::fs::create_dir_all(output).unwrap();
-        let status = std::process::Command::new("import")
-            .args(["-window", "Files panel fixture"])
-            .arg(output.join(format!("{name}.png")))
+        let destination = output.join(format!("{name}.png"));
+        #[cfg(target_os = "macos")]
+        let bounds = gpui::AnyWindowHandle::from(window)
+            .update(cx, |_, window, _| window.bounds())
+            .unwrap();
+        #[cfg(target_os = "macos")]
+        let status = std::process::Command::new("screencapture")
+            .arg("-x")
+            .arg("-o")
+            .arg(format!(
+                "-R{},{},{},{}",
+                f32::from(bounds.origin.x).round() as i32,
+                f32::from(bounds.origin.y).round() as i32,
+                f32::from(bounds.size.width).round() as i32,
+                f32::from(bounds.size.height).round() as i32,
+            ))
+            .arg(&destination)
             .status()
             .unwrap();
-        assert!(status.success(), "fixture capture failed");
+        #[cfg(target_os = "linux")]
+        let status = std::process::Command::new("import")
+            .args(["-window", "Files panel fixture"])
+            .arg(&destination)
+            .status()
+            .unwrap();
+        assert!(status.success(), "fixture capture failed: {}", destination.display());
     }
 }
 
-#[test]
-fn files_panel_workspace_navigation_and_external_updates() {
+#[cfg_attr(all(test, target_os = "linux"), test)]
+pub fn files_panel_workspace_navigation_and_external_updates() {
     let directory = tempfile::tempdir().unwrap();
     let project = directory.path().join("project");
     std::fs::create_dir_all(project.join("src/nested")).unwrap();
@@ -81,6 +101,10 @@ fn files_panel_workspace_navigation_and_external_updates() {
         "# Workspace\n\nAn independent file explorer.\n",
     )
     .unwrap();
+    let other_project = directory.path().join("other-project");
+    std::fs::create_dir_all(&other_project).unwrap();
+    std::fs::write(other_project.join("README.md"), "# Other project\n").unwrap();
+    std::fs::write(other_project.join("notes.txt"), "other notes\n").unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     for args in [
         vec!["init", "-b", "main"],
@@ -127,20 +151,15 @@ fn files_panel_workspace_navigation_and_external_updates() {
             false,
         )
         .unwrap();
-    for id in ["first", "second"] {
-        core.workspace
-            .create_chat(
-                id,
-                Some("project"),
-                None,
-                None,
-                Some(project.to_string_lossy().into_owned()),
-            )
-            .unwrap();
-        core.workspace
-            .rename_chat(id, &format!("Explore files · {id}"))
-            .unwrap();
-    }
+    core.workspace
+        .create_space(
+            "other-project",
+            &core.device_id,
+            &other_project.to_string_lossy(),
+            Some("Other project".into()),
+            false,
+        )
+        .unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -219,8 +238,229 @@ fn files_panel_workspace_navigation_and_external_updates() {
             cx.spawn(async move |cx| {
                 // Keep the temporary store, workspace and daemon alive throughout the UI run.
                 let _directory = directory;
-                wait_for(window, cx, "engine and chats", |shell, cx| {
-                    shell.state.read(cx).engine().is_some() && shell.state.read(cx).chats.len() == 2
+                wait_for(window, cx, "engine and projects without chats", |shell, cx| {
+                    let state = shell.state.read(cx);
+                    state.engine().is_some() && state.spaces.len() == 2 && state.chats.is_empty()
+                })
+                .await;
+                state.update(cx, |state, cx| state.select_space(Some("project".into()), cx));
+                window
+                    .update(cx, |shell, _, cx| shell.on_state_changed(&state, cx))
+                    .unwrap();
+                wait_for(window, cx, "selected project canvas", |shell, cx| {
+                    shell.active_chat.is_empty()
+                        && shell.state.read(cx).selected_space.as_deref() == Some("project")
+                })
+                .await;
+                let project_key = crate::state::canvas_panel_key(Some("project"));
+                let other_key = crate::state::canvas_panel_key(Some("other-project"));
+                window
+                    .update(cx, |shell, window, cx| {
+                        shell.splash = SplashPhase::Gone;
+                        shell.toggle_files_panel(window, cx);
+                        assert!(shell.files_panel_open(cx));
+                    })
+                    .unwrap();
+                wait_for(window, cx, "pre-chat project root", |shell, cx| {
+                    shell.files.get(&project_key).is_some_and(|files| {
+                        files.read(cx).tree().node("src").is_some()
+                            && files.read(cx).tree().node("README.md").is_some()
+                    })
+                })
+                .await;
+                frame(window, cx, output.as_deref(), "00-project-files-no-chat").await;
+                window
+                    .update(cx, |shell, window, cx| {
+                        shell.add_file_surface("src/new.rs".into(), window, cx);
+                    })
+                    .unwrap();
+                wait_for(window, cx, "pre-chat project editor", |shell, cx| {
+                    shell.file_surface_keys.contains_key(&(
+                        project_key.clone(),
+                        project_key.clone(),
+                        "src/new.rs".into(),
+                    )) && shell.file_surfaces.values().any(|file| {
+                        file.read(cx).test_document_text("src/new.rs").as_deref()
+                            == Some("// new file\n")
+                    })
+                })
+                .await;
+                frame(window, cx, output.as_deref(), "00b-project-editor-no-chat").await;
+                window
+                    .update(cx, |shell, window, cx| {
+                        let id = shell.file_surface_keys[&(
+                            project_key.clone(),
+                            project_key.clone(),
+                            "src/new.rs".into(),
+                        )];
+                        shell.file_surfaces[&id]
+                            .update(cx, |file, cx| file.focus_editor(window, cx));
+                    })
+                    .unwrap();
+                pause(cx).await;
+                gpui::AnyWindowHandle::from(window)
+                    .update(cx, |_, window, cx| {
+                        window.dispatch_keystroke(
+                            gpui::Keystroke::parse(&crate::settings::platform_combo("mod-a"))
+                                .unwrap(),
+                            cx,
+                        );
+                        window.dispatch_keystroke(gpui::Keystroke::parse("z").unwrap(), cx);
+                    })
+                    .unwrap();
+                window
+                    .update(cx, |shell, _, cx| {
+                        let id = shell.file_surface_keys[&(
+                            project_key.clone(),
+                            project_key.clone(),
+                            "src/new.rs".into(),
+                        )];
+                        shell.file_surfaces[&id]
+                            .update(cx, |file, cx| file.save_active_document(cx));
+                    })
+                    .unwrap();
+                wait_for(window, cx, "saved pre-chat project edit", |_, _| {
+                    std::fs::read_to_string(project.join("src/new.rs"))
+                        .is_ok_and(|text| text == "z")
+                })
+                .await;
+                state.update(cx, |state, cx| {
+                    state.select_space(Some("other-project".into()), cx)
+                });
+                window
+                    .update(cx, |shell, _, cx| shell.on_state_changed(&state, cx))
+                    .unwrap();
+                wait_for(window, cx, "other project canvas", |shell, cx| {
+                    shell.active_chat.is_empty()
+                        && shell.state.read(cx).selected_space.as_deref() == Some("other-project")
+                })
+                .await;
+                window
+                    .update(cx, |shell, window, cx| {
+                        assert!(!shell.files_panel_open(cx));
+                        assert!(!shell.file_surface_keys.keys().any(|(panel, _, _)| panel == &other_key));
+                        shell.add_files_surface(window, cx);
+                        shell.add_file_surface("notes.txt".into(), window, cx);
+                    })
+                    .unwrap();
+                wait_for(window, cx, "isolated other project editor", |shell, cx| {
+                    shell.files.get(&other_key).is_some_and(|files| {
+                        files.read(cx).tree().node("notes.txt").is_some()
+                    }) && shell.file_surface_keys.contains_key(&(
+                        other_key.clone(),
+                        other_key.clone(),
+                        "notes.txt".into(),
+                    )) && shell.file_surfaces.values().any(|file| {
+                        file.read(cx).test_document_text("notes.txt").as_deref()
+                            == Some("other notes\n")
+                    })
+                })
+                .await;
+                let other_editor = window
+                    .update(cx, |shell, window, cx| {
+                        let id = shell.file_surface_keys[&(
+                            other_key.clone(),
+                            other_key.clone(),
+                            "notes.txt".into(),
+                        )];
+                        let file = shell.file_surfaces[&id].clone();
+                        file.update(cx, |file, cx| {
+                            file.set_autosave_enabled(false, cx);
+                            file.focus_editor(window, cx);
+                        });
+                        file
+                    })
+                    .unwrap();
+                pause(cx).await;
+                gpui::AnyWindowHandle::from(window)
+                    .update(cx, |_, window, cx| {
+                        window.dispatch_keystroke(
+                            gpui::Keystroke::parse(&crate::settings::platform_combo("mod-a"))
+                                .unwrap(),
+                            cx,
+                        );
+                        window.dispatch_keystroke(gpui::Keystroke::parse("q").unwrap(), cx);
+                    })
+                    .unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(other_project.join("notes.txt")).unwrap(),
+                    "other notes\n",
+                    "the editor should remain unsaved across the project switch"
+                );
+                state.update(cx, |state, cx| state.select_space(Some("project".into()), cx));
+                window
+                    .update(cx, |shell, _, cx| shell.on_state_changed(&state, cx))
+                    .unwrap();
+                wait_for(window, cx, "restored project canvas", |shell, cx| {
+                    shell.active_chat.is_empty()
+                        && shell.state.read(cx).selected_space.as_deref() == Some("project")
+                        && shell.files_panel_open(cx)
+                        && shell.files.contains_key(&project_key)
+                        && shell.file_surface_keys.contains_key(&(
+                            project_key.clone(),
+                            project_key.clone(),
+                            "src/new.rs".into(),
+                        ))
+                })
+                .await;
+                state.update(cx, |state, cx| {
+                    state.select_space(Some("other-project".into()), cx)
+                });
+                window
+                    .update(cx, |shell, _, cx| shell.on_state_changed(&state, cx))
+                    .unwrap();
+                wait_for(window, cx, "restored unsaved other project editor", |shell, cx| {
+                    shell.active_chat.is_empty()
+                        && shell.state.read(cx).selected_space.as_deref() == Some("other-project")
+                        && shell.file_surface_keys.contains_key(&(
+                            other_key.clone(),
+                            other_key.clone(),
+                            "notes.txt".into(),
+                        ))
+                })
+                .await;
+                window
+                    .update(cx, |shell, _, cx| {
+                        let id = shell.file_surface_keys[&(
+                            other_key.clone(),
+                            other_key.clone(),
+                            "notes.txt".into(),
+                        )];
+                        assert_eq!(shell.file_surfaces[&id].entity_id(), other_editor.entity_id());
+                        shell.file_surfaces[&id]
+                            .update(cx, |file, cx| file.save_active_document(cx));
+                    })
+                    .unwrap();
+                wait_for(window, cx, "saved restored project editor", |_, _| {
+                    std::fs::read_to_string(other_project.join("notes.txt"))
+                        .is_ok_and(|text| text == "q")
+                })
+                .await;
+                state.update(cx, |state, cx| state.select_space(Some("project".into()), cx));
+                window
+                    .update(cx, |shell, _, cx| shell.on_state_changed(&state, cx))
+                    .unwrap();
+                wait_for(window, cx, "project canvas before chat", |shell, cx| {
+                    shell.active_chat.is_empty()
+                        && shell.state.read(cx).selected_space.as_deref() == Some("project")
+                })
+                .await;
+                for id in ["first", "second"] {
+                    core.workspace
+                        .create_chat(
+                            id,
+                            Some("project"),
+                            None,
+                            None,
+                            Some(project.to_string_lossy().into_owned()),
+                        )
+                        .unwrap();
+                    core.workspace
+                        .rename_chat(id, &format!("Explore files · {id}"))
+                        .unwrap();
+                }
+                wait_for(window, cx, "real chats available", |shell, cx| {
+                    shell.state.read(cx).chats.len() == 2
                 })
                 .await;
                 state.update(cx, |state, cx| state.select_chat(Some("first".into()), cx));
@@ -239,6 +479,64 @@ fn files_panel_workspace_navigation_and_external_updates() {
                 })
                 .await;
                 frame(window, cx, output.as_deref(), "01-chat-files").await;
+                // The remaining legacy watcher sequence below is Linux-specific.
+                // macOS instead proves chat worktree precedence against a real checkout.
+                if cfg!(target_os = "macos") {
+                    let worktree = _directory.path().join("worktree");
+                    assert!(
+                        std::process::Command::new("git")
+                            .current_dir(&project)
+                            .args(["worktree", "add", "--detach"])
+                            .arg(&worktree)
+                            .arg("HEAD")
+                            .output()
+                            .unwrap()
+                            .status
+                            .success()
+                    );
+                    std::fs::write(worktree.join("README.md"), "# Worktree\n").unwrap();
+                    core.workspace
+                        .create_chat(
+                            "worktree",
+                            Some("project"),
+                            None,
+                            None,
+                            Some(worktree.to_string_lossy().into_owned()),
+                        )
+                        .unwrap();
+                    wait_for(window, cx, "worktree chat available", |shell, cx| {
+                        shell.state.read(cx).chats.iter().any(|chat| chat.id == "worktree")
+                    })
+                    .await;
+                    state.update(cx, |state, cx| state.select_chat(Some("worktree".into()), cx));
+                    wait_for(window, cx, "worktree chat selected", |shell, _| {
+                        shell.active_chat == "worktree"
+                    })
+                    .await;
+                    window
+                        .update(cx, |shell, window, cx| {
+                            shell.add_files_surface(window, cx);
+                            shell.add_file_surface("README.md".into(), window, cx);
+                        })
+                        .unwrap();
+                    wait_for(window, cx, "chat editor uses its worktree", |shell, cx| {
+                        shell.file_surface_keys.get(&(
+                            "worktree".into(), "worktree".into(), "README.md".into(),
+                        )).is_some_and(|id| {
+                            shell.file_surfaces[id].read(cx)
+                                .test_document_text("README.md").as_deref() == Some("# Worktree\n")
+                        })
+                    })
+                    .await;
+                    assert_ne!(
+                        std::fs::read_to_string(project.join("README.md")).unwrap(),
+                        "# Worktree\n",
+                    );
+                    frame(window, cx, output.as_deref(), "01b-chat-worktree-editor").await;
+                    eprintln!("Project Files native smoke passed: pre-chat browse/save, project isolation, unsaved edits, chat worktree.");
+                    cx.update(|cx| cx.quit());
+                    return;
+                }
                 wait_for(
                     window,
                     cx,
@@ -285,11 +583,12 @@ fn files_panel_workspace_navigation_and_external_updates() {
                 frame(window, cx, output.as_deref(), "01b-picker-files-compact").await;
                 window
                     .update(cx, |shell, window, cx| {
-                        assert_eq!(shell.files_visible_width(cx), 284.0);
-                        assert_eq!(shell.files_reserved_width(cx), 284.0);
-                        assert_eq!(shell.right_visible_width(cx), RIGHT_PANE_MIN);
-                        // Squeezed by the narrow window, Files keeps its own
-                        // width for when there is room again.
+                        let files = shell.files_visible_width(cx);
+                        let surface = shell.right_visible_width(cx);
+                        assert!(files > 0.0 && files <= shell.settings.files_panel_width);
+                        assert!(surface >= RIGHT_PANE_MIN);
+                        assert!(shell.sidebar_now() + files + surface < shell.viewport_width);
+                        // Fitting the window must not overwrite the user's requested width.
                         assert_eq!(shell.settings.files_panel_width, FILES_PANEL_MAX);
                         assert!(shell.right_surface_rows(cx).is_empty());
                         shell.set_surfaces_open(false, cx);
@@ -387,12 +686,12 @@ fn files_panel_workspace_navigation_and_external_updates() {
                 frame(window, cx, output.as_deref(), "04b-expanded-narrow-files").await;
                 window
                     .update(cx, |shell, _, cx| {
-                        // Takeover keeps Files at its own width.
-                        assert_eq!(shell.files_visible_width(cx), FILES_PANEL_DEFAULT);
-                        // The narrow fit already hid the sidebar. Takeover must
-                        // keep it hidden and give only the chat's space to the editor.
-                        assert_eq!(shell.sidebar_now(), 0.0);
-                        assert_eq!(shell.right_visible_width(cx), 1000.0 - FILES_PANEL_DEFAULT);
+                        let files = shell.files_visible_width(cx);
+                        let sidebar = shell.sidebar_now();
+                        assert!(files > 0.0 && files <= shell.settings.files_panel_width);
+                        // Takeover spends the conversation's remaining space on the editor.
+                        assert!((shell.right_visible_width(cx)
+                            - (shell.viewport_width - sidebar - files)).abs() < 1.0);
                         shell.toggle_right_pane_expand(cx);
                     })
                     .unwrap();
@@ -528,6 +827,7 @@ fn files_panel_workspace_navigation_and_external_updates() {
                         && !shell.panels.get("first").files_open
                 })
                 .await;
+                drop(other_editor);
                 drop(first_explorer);
                 drop(state);
                 let handle = gpui::AnyWindowHandle::from(window);

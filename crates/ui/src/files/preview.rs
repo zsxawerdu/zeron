@@ -373,7 +373,18 @@ fn estimated_highlighted_file_bytes(highlight: &HighlightedFile) -> usize {
 
 fn document_key(context: &FilesRequestContext, path: String) -> DocumentKey {
     DocumentKey {
-        chat_id: context.target.chat_id.clone().unwrap_or_default(),
+        chat_id: context
+            .target
+            .chat_id
+            .clone()
+            .or_else(|| {
+                context
+                    .target
+                    .space_id
+                    .as_deref()
+                    .map(|id| crate::state::canvas_panel_key(Some(id)))
+            })
+            .unwrap_or_default(),
         checkout_id: context.checkout_id.clone(),
         path,
     }
@@ -3395,6 +3406,24 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
 
+    #[test]
+    fn project_documents_keep_distinct_owner_keys_without_chat_ids() {
+        let project = |id: &str| FilesRequestContext {
+            target: zeron_proto::WorkspaceTarget {
+                chat_id: None,
+                space_id: Some(id.into()),
+                checkout_path: None,
+            },
+            target_device_id: None,
+            cwd: "/workspace".into(),
+            checkout_id: None,
+        };
+        let first = document_key(&project("one"), "README.md".into());
+        let second = document_key(&project("two"), "README.md".into());
+        assert_eq!(first.chat_id, crate::state::canvas_panel_key(Some("one")));
+        assert_ne!(first, second);
+    }
+
     #[gpui::test]
     fn renaming_markdown_to_text_keeps_dirty_editor_and_undo(cx: &mut TestAppContext) {
         let (files, cx) = super::super::test_support::setup(cx);
@@ -3975,7 +4004,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "files-panel-fixture"))]
 impl FilesSurface {
     pub(crate) fn test_document_text(&self, path: &str) -> Option<String> {
         self.preview
@@ -3991,6 +4020,7 @@ impl FilesSurface {
         Some(format!("{:?}", self.preview.documents.get(path)?.phase))
     }
 
+    #[cfg(test)]
     pub(crate) fn seed_pending_exit_test_document(&mut self, failed: bool) {
         let mut document = FileDocument::loading(DocumentKey {
             chat_id: "test".into(),

@@ -174,8 +174,13 @@ impl Shell {
                 sidebar_limit: self.settings.sidebar_width,
             };
         }
-        let panels = self.panels.get(&self.active_chat);
-        let on_chat = !self.active_chat.is_empty();
+        let owner = if self.active_chat.is_empty() {
+            self.canvas_panel_key.as_deref().unwrap_or("")
+        } else {
+            self.active_chat.as_str()
+        };
+        let panels = self.panels.get(owner);
+        let on_workspace = !owner.is_empty();
         // A closing column keeps its slot while it still paints: one the fit
         // had already hidden closes from zero and claims nothing.
         let present = |open: bool, tween: Option<WidthTween>| {
@@ -190,11 +195,11 @@ impl Shell {
                 self.sidebar_opened_at,
             ),
             (
-                on_chat && present(panels.changes_open, self.right_tween),
+                on_workspace && present(panels.changes_open, self.right_tween),
                 panels.changes_opened_at,
             ),
             (
-                on_chat && present(panels.files_open, self.files_tween),
+                on_workspace && present(panels.files_open, self.files_tween),
                 panels.files_opened_at,
             ),
             self.right_pane_expanded,
@@ -359,7 +364,7 @@ impl Shell {
     /// content columns absorb every change. The share persists with the next
     /// settings save, like a drag. Returns whether the surface host took one.
     fn split_panel_widths(&mut self, cx: &App) -> bool {
-        if !matches!(self.route, Route::Chat) || self.active_chat.is_empty() {
+        if !matches!(self.route, Route::Chat) || !self.files_workspace_available(cx) {
             return false;
         }
         // Split for where the columns will rest, not for a slot a closing
