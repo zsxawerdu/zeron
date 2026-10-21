@@ -26,7 +26,6 @@ const CHAT: &str = "chat-e2e";
 const VIEWER: &str = "viewer-device";
 
 fn run_request(prompt: &str) -> RunRequest {
-    omp: None,
     RunRequest {
         omp: None,
         mcp: None,

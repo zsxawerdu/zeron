@@ -48,7 +48,6 @@ fn init_quiesce_env() {
 }
 
 fn run_request(prompt: &str) -> RunRequest {
-    omp: None,
     RunRequest {
         omp: None,
         mcp: None,

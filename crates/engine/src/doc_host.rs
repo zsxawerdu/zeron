@@ -577,6 +577,15 @@ pub struct ChatDocHandle {
     /// Queue rows held as explicit steers for a turn-boundary agent. They
     /// lead ordinary queued rows, in the order they were steered.
     steered_rows: Mutex<Vec<String>>,
+    /// Rows already dispatched into a live OMP run's native steering
+    /// queue (W03 delivery ledger): the dispatched prompt text and kind,
+    /// keyed by the queue row's id. The local queue no longer holds
+    /// these rows, so this ledger is what user remove actions and
+    /// post-dispatch reconciliation consult before touching the native
+    /// queue. In-memory only: after an engine restart the native
+    /// snapshot is re-read, and rows the runtime already consumed
+    /// classify as Consumed rather than being resent.
+    dispatched_queue: Mutex<Vec<QueuedMessage>>,
     /// Sends held for a turn-boundary agent's turn end (rather than queued
     /// by the user), with the run configuration each was sent with: the row
     /// carries only its text and images.
@@ -1596,6 +1605,7 @@ impl DocHost {
             drain_lock: tokio::sync::Mutex::new(()),
             command_drain_lock: tokio::sync::Mutex::new(()),
             steered_rows: Mutex::new(Vec::new()),
+            dispatched_queue: Mutex::new(Vec::new()),
             held_sends: Mutex::new(HashMap::new()),
             stopped_by: Mutex::new(None),
             queue_paused: AtomicBool::new(recovered_queue_pending),
@@ -3500,6 +3510,7 @@ impl DocHost {
         let handle = self.open(chat_id)?;
         let id = new_id();
         handle.doc.push_queued(&QueuedMessage {
+            kind: Default::default(),
             id: id.clone(),
             text: text.to_string(),
             attachments,
@@ -3566,8 +3577,106 @@ impl DocHost {
         let removed = handle.doc.remove_queued(id)?;
         if removed {
             handle.publish_queue();
+            return Ok(true);
         }
-        Ok(removed)
+        // Not in the local queue: the row may already be dispatched
+        // into the live run's native steering queue (W03). Consult the
+        // delivery ledger, reconcile first (a consumed row has nothing
+        // to remove), then route the removal into the live runtime —
+        // the runtime's answer decides, never a local guess.
+        let record = lock(&handle.dispatched_queue)
+            .iter()
+            .find(|row| row.id == id)
+            .cloned();
+        if let Some(record) = record
+            && let Some(sessions) = self.sessions()
+        {
+            let ledger = lock(&handle.dispatched_queue).clone();
+            if let Some(verdicts) = sessions.omp_reconcile_queue(chat_id, &ledger).await {
+                let consumed: std::collections::HashSet<&str> = verdicts
+                    .iter()
+                    .filter(|(_, m)| *m == zeron_doc::NativeQueueMatch::Consumed)
+                    .map(|(id, _)| id.as_str())
+                    .collect();
+                lock(&handle.dispatched_queue)
+                    .retain(|row| !consumed.contains(row.id.as_str()));
+                if consumed.contains(id) {
+                    return Ok(false);
+                }
+            }
+            if sessions
+                .omp_remove_queued(chat_id, &record.text, record.kind)
+                .await
+            {
+                lock(&handle.dispatched_queue).retain(|row| row.id != id);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Promote one follow-up into the steering queue (W03), at
+    /// whichever layer currently holds it:
+    /// - already dispatched (delivery-ledger record): route the native
+    ///   promote into the live run; on success the record's kind becomes
+    ///   Steer, so a later remove targets the steering queue.
+    /// - still local: re-mark the row as a steer and lead it into the
+    ///   steer slot, so the turn-end drain steers it instead of
+    ///   prompting after the turn.
+    /// `false` when neither layer holds such a row, or the runtime
+    /// refused the native promote.
+    pub async fn promote_queued_message(
+        &self,
+        chat_id: &str,
+        id: &str,
+    ) -> Result<bool, EngineError> {
+        if !self.is_host(chat_id) {
+            return Err(EngineError::Other(format!(
+                "device {} does not host chat {chat_id}",
+                self.inner.config.device_id
+            )));
+        }
+        let handle = self.open(chat_id)?;
+        let _drain = handle.drain_lock.lock().await;
+        let record = lock(&handle.dispatched_queue)
+            .iter()
+            .find(|row| row.id == id && row.kind == zeron_proto::omp::OmpPromptKind::FollowUp)
+            .cloned();
+        if let Some(record) = record {
+            let Some(sessions) = self.sessions() else {
+                return Ok(false);
+            };
+            if !sessions.omp_promote_queued(chat_id, &record.text).await {
+                return Ok(false);
+            }
+            if let Some(row) = lock(&handle.dispatched_queue)
+                .iter_mut()
+                .find(|row| row.id == id)
+            {
+                row.kind = zeron_proto::omp::OmpPromptKind::Steer;
+            }
+            return Ok(true);
+        }
+        // Local path: only a follow-up row can be promoted; anything
+        // else is already as urgent as it gets.
+        let is_follow_up = handle
+            .doc
+            .read_queue()?
+            .iter()
+            .any(|row| row.id == id && row.kind == zeron_proto::omp::OmpPromptKind::FollowUp);
+        if !is_follow_up {
+            return Ok(false);
+        }
+        if !handle
+            .doc
+            .set_queued_kind(id, zeron_proto::omp::OmpPromptKind::Steer)?
+        {
+            return Ok(false);
+        }
+        let slot = handle.steer_slot(id)?;
+        handle.doc.move_queued(id, slot)?;
+        handle.publish_queue();
+        Ok(true)
     }
 
     /// Acquire the host-side right to edit one queued row. This operation and
@@ -4290,7 +4399,31 @@ impl DocHost {
                 .steer(chat_id, &prompt, Some(message_id.clone()))
                 .await?
             {
-                SteerOutcome::Accepted => return Ok(()),
+                SteerOutcome::Accepted => {
+                    // Delivery ledger (W03): the row now lives in the
+                    // runtime's native steering queue under the exact
+                    // dispatched text. Record it, then reconcile the
+                    // ledger against the native snapshot so rows the
+                    // runtime already consumed are pruned, not later
+                    // "removed" or resent.
+                    let mut record = item.clone();
+                    record.text = prompt.clone();
+                    record.kind = zeron_proto::omp::OmpPromptKind::Steer;
+                    lock(&handle.dispatched_queue).push(record);
+                    let ledger = lock(&handle.dispatched_queue).clone();
+                    if let Some(verdicts) = sessions.omp_reconcile_queue(chat_id, &ledger).await {
+                        let consumed: std::collections::HashSet<&str> = verdicts
+                            .iter()
+                            .filter(|(_, m)| *m == zeron_doc::NativeQueueMatch::Consumed)
+                            .map(|(id, _)| id.as_str())
+                            .collect();
+                        if !consumed.is_empty() {
+                            lock(&handle.dispatched_queue)
+                                .retain(|row| !consumed.contains(row.id.as_str()));
+                        }
+                    }
+                    return Ok(());
+                }
                 SteerOutcome::DeferredByUpdate => {
                     return Err(EngineError::Other(
                         "agent update pending; the message remains queued".into(),
@@ -5599,6 +5732,7 @@ impl DocHost {
         request: Option<&zeron_proto::RunRequest>,
     ) -> Result<(), EngineError> {
         let item = QueuedMessage {
+            kind: Default::default(),
             id: message_id.to_string(),
             text: prompt.to_string(),
             attachments: request.map(|r| r.attachments.clone()).unwrap_or_default(),

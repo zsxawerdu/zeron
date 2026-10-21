@@ -611,7 +611,7 @@ impl Harness for OmpHarness {
             request_input,
             mut steering,
             interrupt,
-            turn: _,
+            turn,
         } = controls;
         let input: Arc<Input> = Arc::from(request_input);
         let (steer_tx, steer_rx) = std::sync::mpsc::channel::<SteerMessage>();
@@ -633,6 +633,7 @@ impl Harness for OmpHarness {
                 steer_rx,
                 interrupt,
                 input,
+                turn,
             );
         });
         Ok(
@@ -693,6 +694,7 @@ fn run_blocking(
     steering: std::sync::mpsc::Receiver<SteerMessage>,
     interrupt: crate::CancellationToken,
     input: Arc<Input>,
+    turn: crate::TurnControl,
 ) {
     let spawned = OmpRuntime::spawn(executable.clone(), &launch, next_generation());
     let mut runtime = match (spawned, &retry_fresh) {
@@ -845,6 +847,25 @@ fn run_blocking(
                 images: None,
             }) {
                 tracing::warn!("OMP steer failed: {error}");
+            }
+        }
+        // Host-routed native queue actions (W03): this driver is the
+        // only writer of the runtime's queue, so remove/promote and
+        // snapshot requests are answered here, against the live
+        // runtime — the runtime's own result is the reply, and any
+        // failure answers false/None rather than a local guess.
+        while let Some(action) = turn.take_queue_action() {
+            use crate::QueueAction;
+            match action {
+                QueueAction::Remove { text, kind, reply } => {
+                    let _ = reply.send(runtime.remove_queued_message(&text, kind).unwrap_or(false));
+                }
+                QueueAction::Promote { text, reply } => {
+                    let _ = reply.send(runtime.promote_queued_message(&text).unwrap_or(false));
+                }
+                QueueAction::Snapshot { reply } => {
+                    let _ = reply.send(runtime.queue_snapshot().ok());
+                }
             }
         }
         if !interrupted && interrupt.is_cancelled() {

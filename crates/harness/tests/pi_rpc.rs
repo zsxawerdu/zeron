@@ -12,7 +12,6 @@ fn harness() -> PiHarness {
         .with_graces(Duration::from_millis(100), Duration::from_millis(100))
 }
 fn request(cwd: &std::path::Path, prompt: &str) -> RunRequest {
-    omp: None,
     RunRequest {
         omp: None,
         prompt: prompt.into(),

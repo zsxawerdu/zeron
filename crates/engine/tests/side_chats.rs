@@ -396,7 +396,6 @@ async fn side_turn(
     prompt: &str,
     message_id: &str,
 ) -> RunRequest {
-    omp: None,
     let before = requests.lock().unwrap().len();
     let resume = core
         .workspace

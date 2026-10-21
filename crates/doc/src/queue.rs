@@ -17,6 +17,7 @@
 
 use loro::ToJson;
 use serde::{Deserialize, Serialize};
+use zeron_proto::omp::{OmpPromptKind, OmpQueueSnapshot};
 
 use crate::schema::{DocError, SessionDoc};
 
@@ -29,6 +30,11 @@ pub struct QueuedMessage {
     pub id: String,
     /// What the user typed. Never empty — emptying it deletes the row.
     pub text: String,
+    /// Delivery kind (W03): a fresh prompt, a steer into the live turn,
+    /// or a follow-up after it. Additive; rows written before this field
+    /// existed read as `Prompt`, their historical behavior.
+    #[serde(default, skip_serializing_if = "is_prompt_kind")]
+    pub kind: OmpPromptKind,
     /// Committed upload paths, staged at queue time so the row never points at
     /// files that only exist on the device that typed it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -81,6 +87,86 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn is_prompt_kind(kind: &OmpPromptKind) -> bool {
+    matches!(kind, OmpPromptKind::Prompt)
+}
+
+fn kind_token(kind: OmpPromptKind) -> &'static str {
+    match kind {
+        OmpPromptKind::Prompt => "prompt",
+        OmpPromptKind::Steer => "steer",
+        OmpPromptKind::FollowUp => "follow-up",
+    }
+}
+
+fn parse_kind(token: Option<&str>) -> OmpPromptKind {
+    match token {
+        Some("steer") => OmpPromptKind::Steer,
+        Some("follow-up") => OmpPromptKind::FollowUp,
+        _ => OmpPromptKind::Prompt,
+    }
+}
+
+/// How one local queue row stands against OMP's native queue snapshot
+/// after in-order text pairing within its kind list (W03). The runtime
+/// gives queued items no IDs, so this is the honest precision ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeQueueMatch {
+    /// Paired with a still-queued native entry of the same text/kind.
+    Queued,
+    /// No native entry carries this text: OMP admitted and consumed it
+    /// (or it already ran) — it must not be resent.
+    Consumed,
+    /// The text exists natively but every instance is already paired
+    /// with an earlier identical local row: this row may be the queued
+    /// one or a consumed duplicate. Never guess; surface it.
+    Ambiguous,
+    /// Prompt rows are not listed in the native steering/follow-up
+    /// snapshot, so the snapshot says nothing about them.
+    Untracked,
+}
+
+/// Reconcile local queue rows with the native queue snapshot, pairing
+/// in order by verbatim text within each kind list. Attachments and row
+/// ids stay local concerns: the native side holds neither, and the
+/// pairing never reorders or drops local rows — callers decide what
+/// each classification means for delivery.
+pub fn reconcile_with_native(
+    rows: &[QueuedMessage],
+    native: &OmpQueueSnapshot,
+) -> Vec<(String, NativeQueueMatch)> {
+    let mut steering: Vec<&str> = native.steering.iter().map(String::as_str).collect();
+    let mut follow_up: Vec<&str> = native.follow_up.iter().map(String::as_str).collect();
+    rows.iter()
+        .map(|row| {
+            if matches!(row.kind, OmpPromptKind::Prompt) {
+                return (row.id.clone(), NativeQueueMatch::Untracked);
+            }
+            let own_list = match row.kind {
+                OmpPromptKind::Steer => &native.steering,
+                _ => &native.follow_up,
+            };
+            let text_seen_natively = own_list.iter().any(|text| text == &row.text);
+            let pool = match row.kind {
+                OmpPromptKind::Steer => &mut steering,
+                _ => &mut follow_up,
+            };
+            let classification = match pool.iter().position(|text| *text == row.text) {
+                Some(at) => {
+                    pool.remove(at);
+                    NativeQueueMatch::Queued
+                }
+                // In the native list but every instance is paired with
+                // an earlier identical row: which duplicate is queued
+                // is unknowable — report it, never guess.
+                None if text_seen_natively => NativeQueueMatch::Ambiguous,
+                None => NativeQueueMatch::Consumed,
+            };
+            (row.id.clone(), classification)
+        })
+        .collect()
+}
+
 impl QueuedMessage {
     pub fn new(
         id: impl Into<String>,
@@ -90,6 +176,7 @@ impl QueuedMessage {
         Self {
             id: id.into(),
             text: text.into(),
+            kind: OmpPromptKind::Prompt,
             attachments: Vec::new(),
             hold_for_turn_end: false,
             issued_by: issued_by.into(),
@@ -172,6 +259,37 @@ impl SessionDoc {
         }
         map.insert("text", text)?;
         map.insert("editedAt", now_ms)?;
+        self.doc().commit();
+        Ok(true)
+    }
+
+    /// Change one row's delivery kind in place (W03 promote: a local
+    /// follow-up becomes a steer). `false` when the row is missing or
+    /// already carries that kind. Attachments, text and gates are
+    /// untouched — only the `kind` key changes.
+    pub fn set_queued_kind(&self, id: &str, kind: OmpPromptKind) -> Result<bool, DocError> {
+        let queue = self.doc().get_movable_list("queue");
+        let Some(index) = index_of(&queue, id) else {
+            return Ok(false);
+        };
+        let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) = queue.get(index)
+        else {
+            return Ok(false);
+        };
+        let current = match map.get("kind") {
+            Some(loro::ValueOrContainer::Value(loro::LoroValue::String(s))) => {
+                parse_kind(Some(s.as_str()))
+            }
+            _ => OmpPromptKind::Prompt,
+        };
+        if current == kind {
+            return Ok(false);
+        }
+        if is_prompt_kind(&kind) {
+            map.delete("kind")?;
+        } else {
+            map.insert("kind", kind_token(kind))?;
+        }
         self.doc().commit();
         Ok(true)
     }
@@ -339,6 +457,9 @@ fn index_of(queue: &loro::LoroMovableList, id: &str) -> Option<usize> {
 fn write_queued_map(map: &loro::LoroMap, item: &QueuedMessage) -> Result<(), DocError> {
     map.insert("id", item.id.as_str())?;
     map.insert("text", item.text.as_str())?;
+    if !is_prompt_kind(&item.kind) {
+        map.insert("kind", kind_token(item.kind))?;
+    }
     map.insert("issuedBy", item.issued_by.as_str())?;
     map.insert("issuedAt", item.issued_at)?;
     if !item.attachments.is_empty() {
@@ -374,6 +495,7 @@ fn queued_from_json(v: serde_json::Value) -> Option<QueuedMessage> {
     Some(QueuedMessage {
         id,
         text,
+        kind: parse_kind(v.get("kind").and_then(|k| k.as_str())),
         attachments: v
             .get("attachments")
             .and_then(|a| serde_json::from_value(a.clone()).ok())
@@ -415,6 +537,7 @@ mod tests {
 
     fn item(id: &str, text: &str) -> QueuedMessage {
         QueuedMessage {
+            kind: Default::default(),
             id: id.into(),
             text: text.into(),
             attachments: Vec::new(),
@@ -455,6 +578,62 @@ mod tests {
         doc.push_queued(&item("q1", "first")).unwrap();
         doc.insert_queued(99, &item("q2", "second")).unwrap();
         assert_eq!(texts(&doc), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn kind_round_trips_and_legacy_rows_read_as_prompt() {
+        let doc = doc();
+        let mut steer = item("q1", "steer this");
+        steer.kind = OmpPromptKind::Steer;
+        doc.push_queued(&steer).unwrap();
+        doc.push_queued(&item("q2", "plain")).unwrap();
+        let rows = doc.read_queue().unwrap();
+        assert_eq!(rows[0].kind, OmpPromptKind::Steer);
+        assert_eq!(rows[1].kind, OmpPromptKind::Prompt);
+    }
+
+    #[test]
+    fn set_queued_kind_promotes_a_follow_up_in_place() {
+        let doc = doc();
+        let mut follow_up = item("q1", "after the turn");
+        follow_up.kind = OmpPromptKind::FollowUp;
+        follow_up.attachments = vec!["uploads/a.png".into()];
+        doc.push_queued(&follow_up).unwrap();
+
+        assert!(doc.set_queued_kind("q1", OmpPromptKind::Steer).unwrap());
+        // Already a steer: no-op, and nothing else about the row moved.
+        assert!(!doc.set_queued_kind("q1", OmpPromptKind::Steer).unwrap());
+        assert!(!doc.set_queued_kind("missing", OmpPromptKind::Steer).unwrap());
+        let rows = doc.read_queue().unwrap();
+        assert_eq!(rows[0].kind, OmpPromptKind::Steer);
+        assert_eq!(rows[0].text, "after the turn");
+        assert_eq!(rows[0].attachments, vec!["uploads/a.png".to_string()]);
+    }
+
+    #[test]
+    fn reconcile_pairs_in_order_and_reports_duplicate_ambiguity() {
+        let mut steer = item("q1", "same text");
+        steer.kind = OmpPromptKind::Steer;
+        let mut duplicate = item("q2", "same text");
+        duplicate.kind = OmpPromptKind::Steer;
+        let mut gone = item("q3", "already ran");
+        gone.kind = OmpPromptKind::FollowUp;
+        let prompt = item("q4", "fresh prompt");
+        let native = OmpQueueSnapshot {
+            steering: vec!["same text".into()],
+            follow_up: vec![],
+            live_steered: 0,
+        };
+        let verdicts = reconcile_with_native(&[steer, duplicate, gone, prompt], &native);
+        assert_eq!(
+            verdicts,
+            vec![
+                ("q1".to_string(), NativeQueueMatch::Queued),
+                ("q2".to_string(), NativeQueueMatch::Ambiguous),
+                ("q3".to_string(), NativeQueueMatch::Consumed),
+                ("q4".to_string(), NativeQueueMatch::Untracked),
+            ]
+        );
     }
 
     #[test]

@@ -240,6 +240,9 @@ pub enum MessagePart {
     #[serde(rename_all = "camelCase")]
     OmpStructured {
         id: String,
+        /// Serialized as `eventKind`: plain `kind` would collide with the
+        /// enum's internal serde tag of the same name.
+        #[serde(rename = "eventKind")]
         kind: String,
         native: serde_json::Value,
     },
@@ -425,15 +428,17 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 {
                     *e = *is_error;
                     *resolved = true;
-                    // Tool OUTPUTS never enter the doc (2026-08-10 product
-                    // call: chips are one-liners — name + call info — like
-                    // pre-output builds; the R2 sidecar is parked with them,
-                    // docs/chat2-sync.md A2). Full text lives only in the
-                    // host's run journal. Inline diffs die the same way:
-                    // stats only, never text. `is_error` still folds so
-                    // failed chips read as failed.
-                    let _ = output; // journal-only
-                    *out_slot = None;
+                    // Full tool output never enters the doc; the doc
+                    // carries the bounded presentation summary
+                    // ([`summarize_tool_output`], W02 step: summaries +
+                    // detail references replace destructive stripping).
+                    // The original stays in the host run journal and, for
+                    // OMP, in native history — fetched owner-side by tool
+                    // call id / `omp_entry_id` (handoff C4), never
+                    // reconstructed from the summary. Inline diff text
+                    // dies the same way: stats only. `is_error` still
+                    // folds so failed chips read as failed.
+                    *out_slot = output.as_deref().and_then(summarize_tool_output);
                     *output_bytes = None;
                     *diff_slot = None;
                     *diff_stats = diff.as_ref().map(|d| vec![diff_stat(d)]);
@@ -466,6 +471,36 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     *resolved = true;
                 }
             }
+        }
+        AgentEvent::OmpStructured { kind, native } => {
+            // Tool progress streams many chunks for one call: coalesce
+            // consecutive updates for the same call into one part
+            // (latest payload wins) so the doc does not grow per chunk.
+            let coalesces = matches!(kind.as_str(), "tool_execution_update" | "tool_stream_update")
+                && native
+                    .get("toolCallId")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|tool_call_id| {
+                        matches!(
+                            out.last(),
+                            Some(MessagePart::OmpStructured { kind: prev_kind, native: prev_native, .. })
+                                if prev_kind == kind
+                                    && prev_native.get("toolCallId").and_then(serde_json::Value::as_str)
+                                        == Some(tool_call_id)
+                        )
+                    });
+            if coalesces
+                && let Some(MessagePart::OmpStructured { native: prev_native, .. }) = out.last_mut()
+            {
+                *prev_native = native.clone();
+                return;
+            }
+            let id = format!("omp{}", out.len());
+            out.push(MessagePart::OmpStructured {
+                id,
+                kind: kind.clone(),
+                native: native.clone(),
+            });
         }
         AgentEvent::Error { message } => {
             let id = format!("e{}", out.len());
@@ -613,7 +648,11 @@ pub fn sidecar_payload(event: &AgentEvent) -> Option<SidecarPayload> {
 /// and a subagent spawn's model/type (see [`spawn_badge`] — a couple of short
 /// identifiers the chip names the child by).
 /// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, Mcp/Unknown input.
-/// Full inputs remain only in the host's local run journal. Idempotent.
+/// Full inputs remain in the host's local run journal and, for OMP calls,
+/// in OMP native history: the part's id (the tool call id) plus its
+/// `omp_entry_id` when stamped are the owner-side detail reference
+/// (handoff C4), so stripping here is a presentation boundary, not data
+/// loss. Idempotent.
 pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
     match call {
         ToolCall::WriteFile { path, .. } => ToolCall::WriteFile {
@@ -926,6 +965,28 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_progress_structured_parts_coalesce_per_call() {
+        let update = |text: &str| AgentEvent::OmpStructured {
+            kind: "tool_execution_update".into(),
+            native: serde_json::json!({ "toolCallId": "t1", "partial": text }),
+        };
+        let mut parts = Vec::new();
+        fold_event_into_parts(&mut parts, &update("a"));
+        fold_event_into_parts(&mut parts, &update("ab"));
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].id(), "omp0");
+        // A different kind for the same call does not coalesce.
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::OmpStructured {
+                kind: "tool_result_media".into(),
+                native: serde_json::json!({ "toolCallId": "t1", "media": [] }),
+            },
+        );
+        assert_eq!(parts.len(), 2);
     }
 
     #[test]

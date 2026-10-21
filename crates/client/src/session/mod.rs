@@ -1057,7 +1057,15 @@ impl SessionHandle {
             } else {
                 let config = chat.config.as_ref();
                 let request = RunRequest {
-                    omp: None,
+                    // OMP-aware session config derived from the chat's
+                    // legacy spellings (W02): the OMP driver consumes
+                    // this preferentially; other runtimes ignore it.
+                    omp: config.and_then(|c| {
+                        zeron_proto::omp::OmpSessionConfig::from_legacy(
+                            c.model.as_deref(),
+                            c.reasoning,
+                        )
+                    }),
                     prompt: content,
                     harness: config.map(|c| c.harness),
                     model: config.and_then(|c| c.model.clone()),

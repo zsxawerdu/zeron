@@ -202,7 +202,6 @@ fn fixture(dir: &Path) -> PathBuf {
     bin
 }
 fn request(cwd: &Path, prompt: &str, resume: Option<&str>) -> RunRequest {
-    omp: None,
     RunRequest {
         omp: None,
         mcp: None,

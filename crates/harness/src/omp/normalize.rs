@@ -155,6 +155,41 @@ impl Normalizer {
                 let mut events = Vec::new();
                 if let Some(content) = &message.content {
                     for (index, part) in content.iter().enumerate() {
+                        // Non-text content is preserved as structured
+                        // parts (W02): media/fallback/server-tool blocks
+                        // keep their metadata and native shape, but
+                        // inline image bytes never enter the synced
+                        // projection — the original stays in OMP native
+                        // history, fetchable owner-side.
+                        match part {
+                            AssistantContent::Image(image) => {
+                                events.extend(structured(
+                                    "image_content",
+                                    &serde_json::json!({
+                                        "mimeType": image.mime_type,
+                                        "dataBytes": image.data.as_ref().map(|d| d.len()),
+                                        "url": image.url,
+                                    }),
+                                ));
+                                continue;
+                            }
+                            AssistantContent::RedactedThinking(redacted) => {
+                                events.extend(structured(
+                                    "redacted_thinking",
+                                    &serde_json::json!({ "present": redacted.data.is_some() }),
+                                ));
+                                continue;
+                            }
+                            AssistantContent::Fallback(fallback) => {
+                                events.extend(structured("fallback", fallback));
+                                continue;
+                            }
+                            AssistantContent::AnthropicServerTool(tool) => {
+                                events.extend(structured("anthropic_server_tool", tool));
+                                continue;
+                            }
+                            _ => {}
+                        }
                         let (cache, value, reasoning) = match part {
                             AssistantContent::Text(text) => {
                                 (&mut self.text, text.text.as_deref().unwrap_or(""), false)
@@ -235,6 +270,18 @@ impl Normalizer {
                     output: output.map(|text| cap(&text, 16_384)),
                     diff,
                 }];
+                // Image/media-only results leave a preserved media
+                // record (metadata only; bytes stay in native history),
+                // so an image-only tool result is not a silent blank.
+                if let Some(media) = end.result.as_ref().and_then(result_media) {
+                    events.extend(structured(
+                        "tool_result_media",
+                        &serde_json::json!({
+                            "toolCallId": end.tool_call_id,
+                            "media": media,
+                        }),
+                    ));
+                }
                 // OMP todo ops are incremental; the authoritative phased
                 // snapshot rides each result's details. Re-emitting the
                 // call with it upgrades the folded part in place (the
@@ -255,6 +302,11 @@ impl Normalizer {
             // notices, cache warming, model/thinking/goal/queue changes
             // are preserved with their native payload instead of being
             // dropped. Presentation picks fields; unknown fields survive.
+            // Partial tool execution/stream updates: preserved as
+            // structured parts; the fold coalesces consecutive updates
+            // for one call so progress does not grow the doc per chunk.
+            RpcAgentEvent::ToolExecutionUpdate(e) => structured("tool_execution_update", e),
+            RpcAgentEvent::ToolStreamUpdate(e) => structured("tool_stream_update", e),
             RpcAgentEvent::AutoCompactionStart(e) => structured("auto_compaction_start", e),
             RpcAgentEvent::AutoCompactionEnd(e) => structured("auto_compaction_end", e),
             RpcAgentEvent::AutoRetryStart(e) => structured("auto_retry_start", e),
@@ -302,15 +354,18 @@ impl Normalizer {
                         normalizer: Box::default(),
                     },
                 );
+                // Worker state is preserved on the parent as a
+                // structured part (W02), alongside the spawn chip.
+                let mut events = structured("subagent_lifecycle", &lifecycle_native(payload));
                 // Seed the child's opening entry with its assignment,
                 // like other drivers seed the spawn prompt.
-                match payload.description.clone() {
-                    Some(text) if !text.is_empty() => vec![AgentEvent::Subagent {
+                if let Some(text) = payload.description.clone().filter(|text| !text.is_empty()) {
+                    events.push(AgentEvent::Subagent {
                         parent_tool_use_id: parent,
                         event: Box::new(AgentEvent::UserMessage { text }),
-                    }],
-                    _ => Vec::new(),
+                    });
                 }
+                events
             }
             Status::Completed | Status::Failed | Status::Aborted => {
                 let Some(route) = self.subagents.remove(&payload.id) else {
@@ -324,7 +379,8 @@ impl Normalizer {
                     ),
                     _ => (DoneStatus::Interrupted, None),
                 };
-                vec![AgentEvent::Subagent {
+                let mut events = structured("subagent_lifecycle", &lifecycle_native(payload));
+                events.push(AgentEvent::Subagent {
                     parent_tool_use_id: route.parent_tool_call_id,
                     event: Box::new(AgentEvent::Done {
                         status,
@@ -332,10 +388,39 @@ impl Normalizer {
                         error,
                         session_id: Some(payload.id.clone()),
                     }),
-                }]
+                });
+                events
             }
         }
     }
+}
+
+/// Lifecycle payload for the synced projection: the worker's native
+/// session file is a host-local path and must never sync (C2), so it is
+/// stripped; identity/agent/status/description survive.
+fn lifecycle_native(payload: &omp_rpc::wire::SubagentLifecyclePayload) -> Value {
+    let mut value = serde_json::to_value(payload).unwrap_or(Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        object.remove("sessionFile");
+    }
+    value
+}
+
+/// Media blocks of a tool result (`{content:[{type:"image",…}]}`) as
+/// metadata records: mime type and inline byte size, never the bytes.
+fn result_media(result: &Value) -> Option<Vec<Value>> {
+    let items = result["content"].as_array()?;
+    let media: Vec<Value> = items
+        .iter()
+        .filter(|item| item["type"].as_str() == Some("image"))
+        .map(|item| {
+            serde_json::json!({
+                "mimeType": item["mimeType"],
+                "dataBytes": item["data"].as_str().map(|data| data.len()),
+            })
+        })
+        .collect();
+    (!media.is_empty()).then_some(media)
 }
 
 fn structured(kind: &str, payload: &impl serde::Serialize) -> Vec<AgentEvent> {

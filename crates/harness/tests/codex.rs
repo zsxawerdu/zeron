@@ -92,7 +92,6 @@ async fn execution_lease_outlives_dropped_run_and_title_streams_until_child_is_r
 }
 
 fn request(prompt: &str) -> RunRequest {
-    omp: None,
     RunRequest {
         omp: None,
         mcp: None,

@@ -65,6 +65,28 @@ impl SteerMessage {
     }
 }
 
+/// One queued-message action routed into a live runtime (W03): the
+/// host asks the driver — the only writer of the runtime's native
+/// queue — to remove/promote one natively queued message by verbatim
+/// text, or to report the native queue snapshot for reconciliation.
+/// `reply` carries the runtime's own answer; `false`/`None` means the
+/// runtime did not do it (no such text, unreachable live-steered entry,
+/// or no live runtime), never a locally invented success.
+pub enum QueueAction {
+    Remove {
+        text: String,
+        kind: zeron_proto::omp::OmpPromptKind,
+        reply: oneshot::Sender<bool>,
+    },
+    Promote {
+        text: String,
+        reply: oneshot::Sender<bool>,
+    },
+    Snapshot {
+        reply: oneshot::Sender<Option<zeron_proto::omp::OmpQueueSnapshot>>,
+    },
+}
+
 /// Host ↔ runtime signals that span a persistent runtime's turns.
 ///
 /// Stopping a turn is not tearing down the runtime: a runtime holds work the
@@ -73,16 +95,57 @@ impl SteerMessage {
 /// [`Self::stop_turn`] by ending only the in-flight turn with
 /// `Done { status: Interrupted }` and staying alive for the next prompt; the
 /// `interrupt` token remains the runtime teardown.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TurnControl {
     stop: std::sync::Arc<tokio::sync::Notify>,
     background: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    queue_tx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Sender<QueueAction>>>,
+    queue_rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<QueueAction>>>,
+}
+
+impl Default for TurnControl {
+    fn default() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            stop: std::sync::Arc::new(tokio::sync::Notify::new()),
+            background: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            queue_tx: std::sync::Arc::new(std::sync::Mutex::new(tx)),
+            queue_rx: std::sync::Arc::new(std::sync::Mutex::new(rx)),
+        }
+    }
 }
 
 impl TurnControl {
     /// Host: end the in-flight turn, keeping the runtime and its background work.
     pub fn stop_turn(&self) {
         self.stop.notify_one();
+    }
+
+    /// Host: route one queued-message action into the live runtime.
+    /// The returned receiver yields the driver's answer; a dropped
+    /// receiver (runtime gone) resolves as `false` for callers that
+    /// map it through [`Self::queue_snapshot`]/remove helpers.
+    pub fn queue_action(&self, action: QueueAction) {
+        if let Ok(tx) = self.queue_tx.lock() {
+            let _ = tx.send(action);
+        }
+    }
+
+    /// Host helper: ask the live runtime for its native queue snapshot.
+    pub fn queue_snapshot(
+        &self,
+    ) -> oneshot::Receiver<Option<zeron_proto::omp::OmpQueueSnapshot>> {
+        let (reply, rx) = oneshot::channel();
+        self.queue_action(QueueAction::Snapshot { reply });
+        rx
+    }
+
+    /// Driver: take the next pending queue action, if any. Drivers
+    /// that support native queue actions drain this in their event
+    /// loop; other drivers simply never call it and host actions go
+    /// unanswered (their receivers drop, which hosts read as failure).
+    pub fn take_queue_action(&self) -> Option<QueueAction> {
+        self.queue_rx.lock().ok()?.try_recv().ok()
     }
 
     /// Driver: resolves once per [`Self::stop_turn`].
@@ -486,6 +549,30 @@ pub(crate) fn redact_secrets(text: &str) -> String {
     }
     result.push_str(&text[offset..]);
     result
+}
+
+#[cfg(test)]
+#[test]
+fn queue_actions_reach_the_driver_and_answers_flow_back() {
+    let turn = TurnControl::default();
+    let (reply, mut rx) = oneshot::channel();
+    turn.queue_action(QueueAction::Remove {
+        text: "held message".into(),
+        kind: zeron_proto::omp::OmpPromptKind::Steer,
+        reply,
+    });
+    // Driver side: exactly one action, carrying the verbatim text/kind.
+    match turn.take_queue_action() {
+        Some(QueueAction::Remove { text, kind, reply }) => {
+            assert_eq!(text, "held message");
+            assert_eq!(kind, zeron_proto::omp::OmpPromptKind::Steer);
+            reply.send(true).unwrap();
+        }
+        _ => panic!("queue action did not reach the driver"),
+    }
+    assert!(turn.take_queue_action().is_none());
+    // Host side: the driver's answer is what the host observes.
+    assert_eq!(rx.try_recv(), Ok(true));
 }
 
 #[cfg(test)]

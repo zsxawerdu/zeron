@@ -53,7 +53,6 @@ fn controls(approve_confirms: bool) -> (RunControls, mpsc::Sender<zeron_harness:
 }
 
 fn request(prompt: &str, cwd: &str, resume: Option<String>) -> RunRequest {
-    omp: None,
     RunRequest {
         omp: None,
         prompt: prompt.into(),

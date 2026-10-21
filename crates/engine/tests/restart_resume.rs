@@ -36,7 +36,6 @@ const CHAT: &str = "chat-restart";
 type RequestLog = Arc<Mutex<Vec<RunRequest>>>;
 
 fn run_request(prompt: &str, cwd: &str) -> RunRequest {
-    omp: None,
     RunRequest {
         omp: None,
         mcp: None,

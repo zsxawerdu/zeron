@@ -350,6 +350,74 @@ impl SessionsEngine {
             .await
     }
 
+    /// The live run's turn control for a chat, when a run is up.
+    fn live_turn(&self, chat_id: &str) -> Option<TurnControl> {
+        lock(&self.inner.runs).get(chat_id).map(|h| h.turn.clone())
+    }
+
+    /// Native queue snapshot of the chat's live OMP run (W03). `None`
+    /// when no live run answers — reconciliation against a guessed
+    /// snapshot would be worse than none.
+    pub async fn omp_queue_snapshot(
+        &self,
+        chat_id: &str,
+    ) -> Option<zeron_proto::omp::OmpQueueSnapshot> {
+        let turn = self.live_turn(chat_id)?;
+        turn.queue_snapshot().await.ok().flatten()
+    }
+
+    /// Remove one natively queued message from the chat's live OMP run
+    /// by verbatim text (W03). True only when the runtime removed one;
+    /// no live run, no such text, or an unreachable live-steered entry
+    /// all answer false.
+    pub async fn omp_remove_queued(
+        &self,
+        chat_id: &str,
+        text: &str,
+        kind: zeron_proto::omp::OmpPromptKind,
+    ) -> bool {
+        let Some(turn) = self.live_turn(chat_id) else {
+            return false;
+        };
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        turn.queue_action(zeron_harness::QueueAction::Remove {
+            text: text.to_owned(),
+            kind,
+            reply,
+        });
+        rx.await.unwrap_or(false)
+    }
+
+    /// Promote one queued follow-up into the live run's steering queue
+    /// by verbatim text (W03); same answer discipline as removal.
+    pub async fn omp_promote_queued(&self, chat_id: &str, text: &str) -> bool {
+        let Some(turn) = self.live_turn(chat_id) else {
+            return false;
+        };
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        turn.queue_action(zeron_harness::QueueAction::Promote {
+            text: text.to_owned(),
+            reply,
+        });
+        rx.await.unwrap_or(false)
+    }
+
+    /// Reconcile dispatched local queue rows against the live run's
+    /// native queue (W03): the delivery-ledger check to run after a
+    /// dispatch or a reconnect, before anything is resent. Rows are the
+    /// caller's dispatched set (text + kind + attachments as sent); the
+    /// pairing is `zeron_doc::reconcile_with_native`'s — consumed rows
+    /// must not be resent, ambiguous duplicates are surfaced as-is.
+    /// `None` when no live run answers a snapshot.
+    pub async fn omp_reconcile_queue(
+        &self,
+        chat_id: &str,
+        dispatched: &[zeron_doc::QueuedMessage],
+    ) -> Option<Vec<(String, zeron_doc::NativeQueueMatch)>> {
+        let snapshot = self.omp_queue_snapshot(chat_id).await?;
+        Some(zeron_doc::reconcile_with_native(dispatched, &snapshot))
+    }
+
     pub(crate) fn voice_manager(&self) -> crate::voice::VoiceManager {
         self.inner.voice.clone()
     }
@@ -3293,7 +3361,20 @@ async fn drive_run(
             }
             AgentEvent::OmpSessionBound { binding } => {
                 if let Some(store) = inner.omp_bindings.get() {
-                    store.stamp(&chat_id, binding.clone());
+                    // Exclusive writer (W03/C2): a native session already
+                    // owned by another chat keeps its owner. Refusing the
+                    // stamp leaves the first binding authoritative; the
+                    // conflict is surfaced, not silently overwritten.
+                    if let Some(owner) = store.conflict_for(&chat_id, binding) {
+                        tracing::error!(
+                            chat = %chat_id,
+                            owner = %owner,
+                            session = %binding.session_id,
+                            "OMP native session already bound to another chat; refusing second writer"
+                        );
+                    } else {
+                        store.stamp(&chat_id, binding.clone());
+                    }
                 }
             }
             AgentEvent::OmpPresentation { presentation } => {
@@ -3882,7 +3963,6 @@ mod tests {
     }
 
     fn request() -> RunRequest {
-        omp: None,
         RunRequest {
             omp: None,
             mcp: None,

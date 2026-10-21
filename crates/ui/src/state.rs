@@ -5517,6 +5517,7 @@ mod tests {
             duration_ms: None,
         };
         let row = |id: &str| zeron_doc::QueuedMessage {
+            kind: Default::default(),
             id: id.into(),
             text: "held".into(),
             attachments: vec![],

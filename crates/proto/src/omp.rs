@@ -185,6 +185,51 @@ pub struct OmpSessionConfig {
     pub slow_mode: Option<bool>,
 }
 
+impl OmpSessionConfig {
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none()
+            && self.thinking_level.is_none()
+            && self.fast_mode.is_none()
+            && self.slow_mode.is_none()
+    }
+
+    /// Derive the OMP-native session config from the legacy chat-config
+    /// spellings (`model` string + closed [`crate::ReasoningLevel`]
+    /// ladder). This is the replacement path for the limited shapes:
+    /// new producers populate `RunRequest::omp` through here (or set the
+    /// fields directly) instead of relying on the legacy fields, which
+    /// remain only for non-OMP runtimes until W14.
+    ///
+    /// Lossy edges are explicit, never silent substitutions: a model
+    /// string that is not provider-qualified (including the picker
+    /// sentinel `"default"`) yields no model override, and legacy ladder
+    /// rungs above OMP's top (`Ultra`/`Ultracode`/`Ultrathink`) clamp to
+    /// `max`, matching the harness's legacy wire mapping.
+    pub fn from_legacy(model: Option<&str>, reasoning: Option<crate::ReasoningLevel>) -> Option<Self> {
+        let config = Self {
+            model: model
+                .filter(|model| *model != "default")
+                .and_then(OmpModelRef::parse),
+            thinking_level: reasoning.map(|level| {
+                OmpThinkingLevel::new(match level {
+                    crate::ReasoningLevel::Minimal => "minimal",
+                    crate::ReasoningLevel::Low => "low",
+                    crate::ReasoningLevel::Medium => "medium",
+                    crate::ReasoningLevel::High => "high",
+                    crate::ReasoningLevel::XHigh => "xhigh",
+                    crate::ReasoningLevel::Max
+                    | crate::ReasoningLevel::Ultra
+                    | crate::ReasoningLevel::Ultracode
+                    | crate::ReasoningLevel::Ultrathink => "max",
+                })
+            }),
+            fast_mode: None,
+            slow_mode: None,
+        };
+        (!config.is_empty()).then_some(config)
+    }
+}
+
 /// Full OMP model descriptor (C1/C6): provider-qualified identity,
 /// runtime-discovered thinking levels as opaque tokens, modalities and
 /// limits, plus the raw native record so unknown/future metadata
@@ -333,6 +378,25 @@ impl OmpSlashCommand {
             input_hint: self.input_hint.clone(),
         }
     }
+}
+
+/// Snapshot of OMP's native steering/follow-up queue (`get_state`'s
+/// queued-messages view, surfaced by `queue_update` events). Texts only:
+/// the runtime gives queued items no IDs, so reconciliation against
+/// local rows is by in-order text pairing within each list (C3) —
+/// identical duplicate texts are fundamentally ambiguous there and must
+/// be reported as such, never silently paired (handoff W03).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OmpQueueSnapshot {
+    #[serde(default)]
+    pub steering: Vec<String>,
+    #[serde(default)]
+    pub follow_up: Vec<String>,
+    /// Leading `steering` entries already live-steered into the running
+    /// response; native queue removal cannot reach them.
+    #[serde(default)]
+    pub live_steered: u32,
 }
 
 /// One selectable option of an interaction, with its OMP-supplied
@@ -508,6 +572,24 @@ mod tests {
         assert!(OmpModelRef::parse("bare-model").is_none());
         assert!(OmpModelRef::parse("/x").is_none());
         assert!(OmpModelRef::parse("x/").is_none());
+    }
+
+    #[test]
+    fn session_config_from_legacy_maps_only_qualified_models() {
+        assert_eq!(OmpSessionConfig::from_legacy(None, None), None);
+        assert_eq!(OmpSessionConfig::from_legacy(Some("default"), None), None);
+        // Unqualified model strings never fabricate a provider.
+        assert_eq!(OmpSessionConfig::from_legacy(Some("bare"), None), None);
+        let config = OmpSessionConfig::from_legacy(
+            Some("openai/gpt-5.2"),
+            Some(crate::ReasoningLevel::XHigh),
+        )
+        .unwrap();
+        assert_eq!(config.model, OmpModelRef::parse("openai/gpt-5.2"));
+        assert_eq!(config.thinking_level, Some(OmpThinkingLevel::new("xhigh")));
+        // Above-ladder legacy rungs clamp to OMP's top, like the wire map.
+        let clamped = OmpSessionConfig::from_legacy(None, Some(crate::ReasoningLevel::Ultra)).unwrap();
+        assert_eq!(clamped.thinking_level, Some(OmpThinkingLevel::new("max")));
     }
 
     #[test]

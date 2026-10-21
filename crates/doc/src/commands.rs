@@ -348,7 +348,6 @@ mod tests {
     }
 
     fn run_request() -> RunRequest {
-        omp: None,
         RunRequest {
             omp: None,
             mcp: None,

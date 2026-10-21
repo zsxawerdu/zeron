@@ -150,6 +150,8 @@ fn render_one(entry: &SessionMessageEntry, options: RenderOptions) -> RenderedMe
             // The fork seam is a transcript marker, not agent content: an
             // orchestrator reads the copied history as ordinary turns.
             MessagePart::Fork { .. } => {}
+            // Structured OMP events are session metadata, not agent content.
+            MessagePart::OmpStructured { .. } => {}
         }
     }
     RenderedMessage {

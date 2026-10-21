@@ -1738,8 +1738,11 @@ pub fn rows_for_entry(
                         });
                     }
                     // Tools and thoughts are grouped by the outer arms;
-                    // nothing reaches here.
-                    MessagePart::Tool { .. } | MessagePart::Reasoning { .. } => {}
+                    // nothing reaches here. Structured OMP events are
+                    // preserved in the doc but not yet rendered (W07).
+                    MessagePart::Tool { .. }
+                    | MessagePart::Reasoning { .. }
+                    | MessagePart::OmpStructured { .. } => {}
                 }
             }
         }

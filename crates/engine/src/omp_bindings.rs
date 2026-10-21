@@ -63,6 +63,23 @@ impl OmpBindingStore {
         self.lock().get(chat_id).cloned()
     }
 
+    /// Exclusive-writer check (W03/C2): the chat that already owns this
+    /// binding's native session, when a *different* chat holds it.
+    /// One native session has exactly one app writer; a second chat
+    /// claiming the same (profile, session id) is a conflict to surface,
+    /// never a binding to stamp over the owner's. Same-chat re-stamps
+    /// (leaf/generation refreshes) and other profiles are not conflicts.
+    pub fn conflict_for(&self, chat_id: &str, binding: &OmpSessionBinding) -> Option<String> {
+        self.lock()
+            .iter()
+            .find(|(owner, held)| {
+                owner.as_str() != chat_id
+                    && held.session_id == binding.session_id
+                    && held.profile == binding.profile
+            })
+            .map(|(owner, _)| owner.clone())
+    }
+
     /// Drop a chat's binding (chat deleted/archived away from OMP).
     pub fn forget(&self, chat_id: &str) {
         let snapshot = {
@@ -127,6 +144,25 @@ mod tests {
 
         reopened.forget("chat-1");
         assert!(OmpBindingStore::open(&path).get("chat-1").is_none());
+    }
+
+    #[test]
+    fn a_second_chat_claiming_the_same_session_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OmpBindingStore::open(dir.path().join("omp-sessions.json"));
+        store.stamp("chat-1", binding("native-1"));
+
+        // Same chat refreshing its own binding is not a conflict.
+        assert_eq!(store.conflict_for("chat-1", &binding("native-1")), None);
+        // A different chat claiming the same native session is.
+        assert_eq!(
+            store.conflict_for("chat-2", &binding("native-1")),
+            Some("chat-1".to_string())
+        );
+        // Same session id under another profile is a different session.
+        let mut other_profile = binding("native-1");
+        other_profile.profile = Some("work".into());
+        assert_eq!(store.conflict_for("chat-2", &other_profile), None);
     }
 
     #[test]

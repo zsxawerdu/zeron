@@ -260,7 +260,6 @@ impl FakeOpencode {
 // ---------------------------------------------------------------------------
 
 fn request(prompt: &str) -> RunRequest {
-    omp: None,
     RunRequest {
         omp: None,
         mcp: None,

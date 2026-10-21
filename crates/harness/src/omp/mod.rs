@@ -360,6 +360,57 @@ impl OmpRuntime {
         })
     }
 
+    /// Native steering/follow-up queue snapshot (`get_state`). Texts
+    /// only — the runtime assigns queued items no IDs (see
+    /// [`zeron_proto::omp::OmpQueueSnapshot`]).
+    pub fn queue_snapshot(&self) -> Result<zeron_proto::omp::OmpQueueSnapshot, HarnessError> {
+        let state = self.state()?;
+        Ok(zeron_proto::omp::OmpQueueSnapshot {
+            steering: state.queued_messages.steering,
+            follow_up: state.queued_messages.follow_up,
+            live_steered: state.queued_messages.live_steered.max(0) as u32,
+        })
+    }
+
+    /// Remove one natively queued message by its verbatim chip text
+    /// (`remove_queued_message`); true when OMP removed one. Precision
+    /// is the runtime's: first text match within the named queue, and
+    /// live-steered steering entries cannot be reached. Only
+    /// steer/follow-up rows exist in the native queue — a `Prompt` row
+    /// is a protocol error here, never silently remapped.
+    pub fn remove_queued_message(
+        &self,
+        message: &str,
+        queue: zeron_proto::omp::OmpPromptKind,
+    ) -> Result<bool, HarnessError> {
+        let queue = match queue {
+            zeron_proto::omp::OmpPromptKind::Steer => wire::QueuedMessageQueue::Steering,
+            zeron_proto::omp::OmpPromptKind::FollowUp => wire::QueuedMessageQueue::FollowUp,
+            zeron_proto::omp::OmpPromptKind::Prompt => {
+                return Err(HarnessError::Protocol(
+                    "native queue removal supports steer/follow-up rows only".into(),
+                ));
+            }
+        };
+        Ok(self
+            .call(&wire::RemoveQueuedMessageCommand {
+                message: message.to_owned(),
+                queue,
+            })?
+            .removed)
+    }
+
+    /// Move one queued follow-up into the steering queue by verbatim
+    /// text (`promote_queued_message`); true when OMP promoted one.
+    /// Same first-match text precision as removal.
+    pub fn promote_queued_message(&self, message: &str) -> Result<bool, HarnessError> {
+        Ok(self
+            .call(&wire::PromoteQueuedMessageCommand {
+                message: message.to_owned(),
+            })?
+            .promoted)
+    }
+
     /// Native session tree + active leaf (`get_tree`). Tree nodes are
     /// OMP's raw entry maps, preserved as-is for the inspector (W10).
     pub fn tree(&self) -> Result<wire::SessionTree, HarnessError> {

@@ -129,6 +129,14 @@ struct DocPartJson {
     /// OMP native session entry id that produced this tool call (additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     omp_entry_id: Option<String>,
+    /// OMP structured-event token for `kind: "ompStructured"` parts
+    /// (additive). Named `eventKind` in the map because `kind` already
+    /// carries the part kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event_kind: Option<String>,
+    /// Original OMP structured-event payload, preserved as-is (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native: Option<serde_json::Value>,
 }
 
 /// App parts → doc part json (mirror of `toDocParts`).
@@ -237,6 +245,13 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             source_title: Some(source_title.clone()),
             ..Default::default()
         },
+        MessagePart::OmpStructured { id, kind, native } => DocPartJson {
+            id: id.clone(),
+            kind: "ompStructured".into(),
+            event_kind: Some(kind.clone()),
+            native: Some(native.clone()),
+            ..Default::default()
+        },
     })
 }
 
@@ -303,6 +318,11 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
             id: p.id,
             source_chat_id: p.source_chat_id.unwrap_or_default(),
             source_title: p.source_title.unwrap_or_default(),
+        },
+        "ompStructured" => MessagePart::OmpStructured {
+            id: p.id,
+            kind: p.event_kind.unwrap_or_default(),
+            native: p.native.unwrap_or(serde_json::Value::Null),
         },
         _ => MessagePart::Text {
             id: p.id,
@@ -928,6 +948,12 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     if let Some(omp_entry_id) = &doc_part.omp_entry_id {
         map.insert("ompEntryId", omp_entry_id.as_str())?;
     }
+    if let Some(event_kind) = &doc_part.event_kind {
+        map.insert("eventKind", event_kind.as_str())?;
+    }
+    if let Some(native) = &doc_part.native {
+        map.insert("native", loro_value_from_json(native))?;
+    }
     Ok(())
 }
 
@@ -1469,6 +1495,32 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].role, MessageRole::System);
         assert_eq!(entries[0].parts, vec![seam]);
+    }
+    #[test]
+    fn omp_structured_part_round_trips_through_the_doc() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::OmpStructured {
+                kind: "auto_compaction_start".into(),
+                native: serde_json::json!({ "reason": "threshold", "futureField": 7 }),
+            },
+        );
+        assert_eq!(parts.len(), 1);
+        let doc = SessionDoc::init("omp-structured").unwrap();
+        doc.push_message(&SessionMessageEntry {
+            duration_ms: None,
+            id: "m1".into(),
+            role: MessageRole::Assistant,
+            parts: parts.clone(),
+            created_at: 1,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(entries[0].parts, parts);
     }
     use zeron_proto::{AgentEvent, ToolCall};
 
@@ -2047,12 +2099,13 @@ mod tests {
                 diff_stats,
                 ..
             } => {
-                // One-liner chips: the fold drops outputs entirely (journal
-                // only), so even a direct apply_sidecar_refs call has no
-                // output to key — diff stats still get their ref (this test
-                // calls apply_sidecar_refs directly; the live fold no longer
-                // does).
-                assert_eq!(output.as_deref(), None);
+                // The fold keeps only the bounded presentation summary
+                // (short outputs ride whole); full text stays out of the
+                // doc, so a direct apply_sidecar_refs call still has no
+                // sidecar key (output_bytes is never stamped by the fold)
+                // — diff stats still get their ref (this test calls
+                // apply_sidecar_refs directly; the live fold does not).
+                assert_eq!(output.as_deref(), Some("total 0\nmore lines"));
                 assert_eq!(output_ref.as_deref(), None);
                 assert_eq!(*output_bytes, None);
                 assert!(diff.is_none(), "no inline diff text in the doc");
