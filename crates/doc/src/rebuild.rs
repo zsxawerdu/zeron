@@ -183,6 +183,7 @@ mod tests {
                     subagent_ref: None,
                     subagent_status: None,
                     subagent_tail: None,
+                    omp_entry_id: None,
                 },
             ],
             created_at: 5,

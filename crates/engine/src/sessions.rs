@@ -238,6 +238,9 @@ struct Inner {
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
     turn_listener: OnceLock<TurnListener>,
+    /// Host-local OMP binding store (wired at engine assembly; absent in
+    /// bare tests, where binding stamps no-op).
+    omp_bindings: OnceLock<Arc<crate::omp_bindings::OmpBindingStore>>,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -245,6 +248,17 @@ pub type TurnListener = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Owner gate for OMP detail serving (W02/C4): a binding authorizes
+/// detail only for its own chat. Anything else (no binding, mismatched
+/// chat) is `None` → the caller answers `Forbidden` without revealing
+/// whether a native session exists on this host.
+fn authorize_omp_detail(
+    binding: Option<zeron_proto::omp::OmpSessionBinding>,
+    chat_id: &str,
+) -> Option<zeron_proto::omp::OmpSessionBinding> {
+    binding.filter(|b| b.chat_id == chat_id)
 }
 
 #[derive(Clone)]
@@ -279,8 +293,61 @@ impl SessionsEngine {
                 generated_images: OnceLock::new(),
                 scratch_root: OnceLock::new(),
                 turn_listener: OnceLock::new(),
+                omp_bindings: OnceLock::new(),
             }),
         }
+    }
+
+    /// Wire the host-local OMP binding store (engine assembly; set-once).
+    pub fn set_omp_bindings(&self, store: Arc<crate::omp_bindings::OmpBindingStore>) {
+        let _ = self.inner.omp_bindings.set(store);
+    }
+
+    /// The recorded OMP binding for a chat, when this host has one.
+    pub fn omp_binding(&self, chat_id: &str) -> Option<zeron_proto::omp::OmpSessionBinding> {
+        self.inner.omp_bindings.get()?.get(chat_id)
+    }
+
+    /// Owner-authorized OMP tool-detail fetch (W02, handoff C4): only
+    /// the engine holding the chat's host-local binding may serve
+    /// detail, and only for that binding's native session. No binding
+    /// (not the owner, or an unknown chat) is `Forbidden` — the caller
+    /// learns nothing about sessions this host does not own. A binding
+    /// whose native record is gone yields `Expired`/`Unavailable` from
+    /// the harness fetch; detail is never reconstructed (C4).
+    pub async fn omp_tool_detail(
+        &self,
+        request: zeron_proto::omp::OmpToolDetailRequest,
+    ) -> zeron_proto::omp::OmpToolDetail {
+        use zeron_proto::omp::OmpToolDetail;
+        let binding = self.inner.omp_bindings.get().and_then(|s| s.get(&request.chat_id));
+        let Some(binding) = authorize_omp_detail(binding, &request.chat_id) else {
+            return OmpToolDetail::Forbidden;
+        };
+        if binding.session_id.is_empty() {
+            return OmpToolDetail::Unavailable {
+                reason: "chat has no native OMP session yet".into(),
+            };
+        }
+        // cwd for the resumed probe: the journal's governing session cwd,
+        // else the process cwd (OMP resolves the session by id).
+        let cwd = self
+            .inner
+            .journal_harness_session(&request.chat_id)
+            .map(|(_, cwd)| cwd)
+            .filter(|cwd| !cwd.is_empty())
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
+        let mut harness = zeron_harness::OmpHarness::new();
+        if let Some(profile) = binding.profile.clone() {
+            harness = harness.with_profile(profile);
+        }
+        harness
+            .tool_detail(&binding.session_id, std::path::Path::new(&cwd), &request.tool_call_id)
+            .await
     }
 
     pub(crate) fn voice_manager(&self) -> crate::voice::VoiceManager {
@@ -1254,6 +1321,7 @@ impl SessionsEngine {
                     .or_else(|| {
                         let (_, cwd) = sessions.inner.journal_harness_session(&chat_id)?;
                         Some(RunRequest {
+                            omp: None,
                             mcp: None,
                             prompt: String::new(),
                             harness: None,
@@ -1276,6 +1344,28 @@ impl SessionsEngine {
                 request.resume = None; // dispatch re-injects the remembered session
                 request.attachments = Vec::new();
                 let harness_id = host.harness_for_request(&chat_id, &request);
+                // Never blindly resend a prompt the native runtime may
+                // already have admitted (OMP-only handoff C3): runtimes
+                // with durable native admission verify first. When the
+                // prompt already landed, recovery ends here — the native
+                // session simply continues on the next user prompt.
+                if let Ok(harness) = sessions.inner.registry.resolve(harness_id) {
+                    let resume = sessions
+                        .inner
+                        .resume_for(&chat_id, &request.cwd)
+                        .unwrap_or_default();
+                    if !harness
+                        .safe_to_redispatch(
+                            &resume,
+                            std::path::Path::new(&request.cwd),
+                            &request.prompt,
+                        )
+                        .await
+                    {
+                        tracing::warn!(chat = %chat_id, harness = ?harness_id, "auto-resume skipped: prompt already admitted natively or unverifiable; not resending");
+                        return;
+                    }
+                }
                 match host
                     .dispatch_with_source_context(
                         &sessions,
@@ -2039,6 +2129,7 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 subagent_ref,
                 subagent_status,
                 subagent_tail,
+                omp_entry_id,
             } => MessagePart::Tool {
                 id: id.clone(),
                 call: sanitize_tool_call(call),
@@ -2057,6 +2148,7 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 subagent_ref: subagent_ref.clone(),
                 subagent_status: *subagent_status,
                 subagent_tail: subagent_tail.clone(),
+                omp_entry_id: omp_entry_id.clone(),
             },
             other => other.clone(),
         })
@@ -2224,6 +2316,7 @@ async fn drive_run(
     // re-injects the stored resume id). Option so the retry branch (inside
     // the event loop) can take ownership.
     let mut retry_request = Some(RunRequest {
+        omp: None,
         resume: None,
         ..request.clone()
     });
@@ -3198,6 +3291,27 @@ async fn drive_run(
                 inner.remember_harness_session(&chat_id, session_id, &run_cwd);
                 note_fork_history_session(&doc, carried_history, session_id);
             }
+            AgentEvent::OmpSessionBound { binding } => {
+                if let Some(store) = inner.omp_bindings.get() {
+                    store.stamp(&chat_id, binding.clone());
+                }
+            }
+            AgentEvent::OmpPresentation { presentation } => {
+                // Transient extension presentation: journaled + broadcast
+                // via publish below, never folded into the doc. Logged so
+                // notifications and (until the W04 UI lands) login URLs
+                // are not silently lost.
+                use zeron_proto::omp::OmpPresentation as P;
+                match presentation {
+                    P::Notify { message, kind } => {
+                        tracing::info!(chat = %chat_id, ?kind, "OMP: {message}")
+                    }
+                    P::OpenUrl { url, launch_url, .. } => {
+                        tracing::info!(chat = %chat_id, url = %launch_url.as_deref().unwrap_or(url), "OMP requests opening a URL")
+                    }
+                    other => tracing::debug!(chat = %chat_id, ?other, "OMP presentation"),
+                }
+            }
             AgentEvent::InputRequested { .. } => {
                 // Known-id guaranteed: the unknown-id twin was dropped above,
                 // before the parked gate.
@@ -3449,6 +3563,26 @@ async fn drive_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn omp_detail_owner_gate_requires_binding_for_that_chat() {
+        // Security invariant (W02/C4): detail is served only by the
+        // engine owning the chat's binding, only for that chat.
+        let binding = zeron_proto::omp::OmpSessionBinding {
+            chat_id: "chat-1".into(),
+            profile: None,
+            session_id: "native-1".into(),
+            session_file: None,
+            leaf_id: None,
+            generation: 1,
+        };
+        assert!(authorize_omp_detail(None, "chat-1").is_none());
+        assert!(authorize_omp_detail(Some(binding.clone()), "other-chat").is_none());
+        assert_eq!(
+            authorize_omp_detail(Some(binding), "chat-1").unwrap().session_id,
+            "native-1"
+        );
+    }
 
     #[test]
     fn cursor_recovery_converts_rich_messages_before_json_encoding() {
@@ -3748,7 +3882,9 @@ mod tests {
     }
 
     fn request() -> RunRequest {
+        omp: None,
         RunRequest {
+            omp: None,
             mcp: None,
             prompt: "first".into(),
             harness: None,

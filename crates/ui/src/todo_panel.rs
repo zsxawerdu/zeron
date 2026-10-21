@@ -75,12 +75,14 @@ impl TodoSummary {
         };
         for (ix, item) in items.iter().enumerate() {
             match item.status() {
-                TodoStatus::Completed => summary.done += 1,
+                // Abandoned is terminal: it settles the list like done,
+                // without claiming the work happened.
+                TodoStatus::Completed | TodoStatus::Abandoned => summary.done += 1,
                 TodoStatus::InProgress => {
                     summary.active.get_or_insert(ix);
                     summary.next.get_or_insert(ix);
                 }
-                TodoStatus::Pending => {
+                TodoStatus::Pending | TodoStatus::Blocked => {
                     summary.next.get_or_insert(ix);
                 }
             }
@@ -605,9 +607,11 @@ fn todo_item_row(
 ) -> AnyElement {
     let status = item.status();
     let (color, weight) = match status {
-        TodoStatus::Completed => (theme.text_faint, gpui::FontWeight::NORMAL),
+        TodoStatus::Completed | TodoStatus::Abandoned => {
+            (theme.text_faint, gpui::FontWeight::NORMAL)
+        }
         TodoStatus::InProgress => (theme.text, gpui::FontWeight::MEDIUM),
-        TodoStatus::Pending => (theme.text_muted, gpui::FontWeight::NORMAL),
+        TodoStatus::Pending | TodoStatus::Blocked => (theme.text_muted, gpui::FontWeight::NORMAL),
     };
     div()
         .id(SharedString::from(format!("todo-item-{ix}")))
@@ -680,6 +684,18 @@ fn status_glyph(
             .border_1()
             .border_color(theme.text_faint.opacity(0.7))
             .into_any_element(),
+        // Blocked waits like pending (its blocker note is the detail);
+        // abandoned is terminal — a faint check, never the success color.
+        TodoStatus::Blocked => div()
+            .size(px(10.0))
+            .rounded_full()
+            .border_1()
+            .border_color(theme.warning.opacity(0.8))
+            .into_any_element(),
+        TodoStatus::Abandoned => icon(icons::CHECK)
+            .size(px(12.0))
+            .text_color(theme.text_faint)
+            .into_any_element(),
     }
 }
 
@@ -732,6 +748,7 @@ mod tests {
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
+            omp_entry_id: None,
         }
     }
 
@@ -988,6 +1005,7 @@ mod composer_tests {
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
+                omp_entry_id: None,
             }],
             created_at: 0,
             device_id: "d".into(),

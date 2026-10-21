@@ -63,6 +63,12 @@ pub(crate) fn context(
         HarnessId::Pi => {
             vec![root("PI_CODING_AGENT_DIR", home.join(".pi/agent")).join("auth.json")]
         }
+        HarnessId::Omp => {
+            // OMP owns its credential store (agent.db) — never hashed or
+            // read by Zeron. The YAML config is enough to invalidate the
+            // catalog cache when models/roles change.
+            vec![home.join(".omp/agent/config.yml")]
+        }
         HarnessId::Devin => {
             let data = root("XDG_DATA_HOME", home.join(".local/share"));
             let mut files = vec![data.join("devin/credentials.toml")];
@@ -103,6 +109,9 @@ pub(crate) fn context(
         HarnessId::Grok => &["GROK_", "XAI_"],
         HarnessId::Hermes => &["HERMES_", "OPENAI_", "ANTHROPIC_"],
         HarnessId::Pi => &["PI_", "OPENAI_", "ANTHROPIC_"],
+        HarnessId::Omp => &[
+            "OMP_", "OPENAI_", "ANTHROPIC_", "GOOGLE_", "GEMINI_", "XAI_", "OPENROUTER_",
+        ],
         HarnessId::Devin => &["DEVIN_"],
         HarnessId::Antigravity => &["GEMINI_", "GOOGLE_"],
         HarnessId::Cursor => &["CURSOR_"],

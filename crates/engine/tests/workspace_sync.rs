@@ -144,7 +144,9 @@ where
 }
 
 fn run_request(prompt: &str) -> RunRequest {
+    omp: None,
     RunRequest {
+        omp: None,
         mcp: None,
         prompt: prompt.into(),
         harness: None,
@@ -462,6 +464,7 @@ async fn claim_resolves_a_worktree_cwd_to_the_repo_root_space() {
         .expect("create space");
 
     let request = RunRequest {
+        omp: None,
         cwd: wt.to_string_lossy().into_owned(),
         ..run_request("go do it")
     };
@@ -495,6 +498,7 @@ async fn claimed_chat_row_records_the_run_harness() {
     let core = assemble(dir.path(), "dev-a");
 
     let request = RunRequest {
+        omp: None,
         harness: Some(HarnessId::Cursor),
         ..run_request("go do it")
     };

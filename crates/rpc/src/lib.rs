@@ -53,6 +53,12 @@ pub mod methods {
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_SKILLS: &str = "ListSkills";
     pub const LIST_COMMANDS: &str = "ListCommands";
+    /// Owner-authorized OMP tool-detail fetch (W02, handoff C4).
+    /// Params: `zeron_proto::omp::OmpToolDetailRequest` (`{chatId, toolCallId, entryId?}`);
+    /// reply: `zeron_proto::omp::OmpToolDetail` with explicit
+    /// available/expired/unavailable/forbidden outcome. Only the engine
+    /// owning the chat's native OMP session may serve it.
+    pub const OMP_TOOL_DETAIL: &str = "OmpToolDetail";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
     pub const TAKE_PROJECT_ACTION_SETUP: &str = "TakeProjectActionSetup";
     /// Peer-to-peer delivery fallback: the SENDER's engine forwards a queued

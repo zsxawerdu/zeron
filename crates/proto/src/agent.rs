@@ -23,6 +23,10 @@ pub enum HarnessId {
     /// google's antigravity agent over acp (`agy_acp_server`, installed from
     /// its pinned release archive).
     Antigravity,
+    /// OMP (oh-my-pi), driven over its native `omp --mode rpc-ui` protocol.
+    /// The sole production runtime after the OMP-only cutover (W14 removes
+    /// the other variants); see docs/plans/2026-10-20-omp-only-handoff.md.
+    Omp,
     /// Test harness; never shown in production pickers.
     Mock,
 }
@@ -251,6 +255,13 @@ pub struct RunRequest {
     /// no Zeron tools; title runs never carry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp: Option<McpServer>,
+    /// OMP-native session configuration (W02/C6): provider-qualified
+    /// model, opaque thinking level, fast/slow modes. When set on an
+    /// OMP run it takes precedence over the legacy `model`/`reasoning`
+    /// spellings, which remain for other runtimes until W14. Additive +
+    /// serde-defaulted — old hosts ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omp: Option<crate::omp::OmpSessionConfig>,
 }
 
 /// A stdio MCP server the harness should add to the agent's session, on top
@@ -369,7 +380,9 @@ impl ToolCall {
             ToolCall::Mcp { tool, .. } => tool,
             _ => return false,
         };
-        name == "Agent" || name.starts_with("Agent: ")
+        // "task" is OMP's spawn tool (its lifecycle frames key to the
+        // spawn call, so a non-spawn "task" never receives any).
+        name == "Agent" || name.starts_with("Agent: ") || name == "task"
     }
 
     /// The model a subagent SPAWN was given, when the spawn named one.
@@ -443,7 +456,9 @@ pub fn valid_visual_asset_name(name: &str) -> bool {
 
 /// Where one checklist item stands. Claude's TodoWrite, OpenCode and ACP plans
 /// distinguish the item being worked on from those still waiting; Codex and
-/// Cursor only report done / not done.
+/// Cursor only report done / not done. OMP phased todos add `Blocked`
+/// (waiting on a named blocker) and `Abandoned` (terminal, will not be
+/// done) — additive variants; older docs never carried them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TodoStatus {
@@ -451,6 +466,8 @@ pub enum TodoStatus {
     Pending,
     InProgress,
     Completed,
+    Blocked,
+    Abandoned,
 }
 
 impl TodoStatus {
@@ -460,6 +477,8 @@ impl TodoStatus {
         match raw {
             "completed" | "complete" | "done" => Self::Completed,
             "in_progress" | "inProgress" | "in-progress" | "active" => Self::InProgress,
+            "blocked" => Self::Blocked,
+            "abandoned" => Self::Abandoned,
             _ => Self::Pending,
         }
     }
@@ -483,6 +502,12 @@ pub struct TodoItem {
         deserialize_with = "lenient_todo_status"
     )]
     pub status: Option<TodoStatus>,
+    /// Named phase this item belongs to (OMP phased todos); additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// What a `Blocked` item is waiting on; additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<String>,
 }
 
 impl TodoItem {
@@ -490,7 +515,13 @@ impl TodoItem {
         Self {
             text: text.into(),
             done: status == TodoStatus::Completed,
-            status: (status == TodoStatus::InProgress).then_some(status),
+            status: matches!(
+                status,
+                TodoStatus::InProgress | TodoStatus::Blocked | TodoStatus::Abandoned
+            )
+            .then_some(status),
+            phase: None,
+            blocker: None,
         }
     }
 
@@ -651,6 +682,33 @@ pub enum AgentEvent {
     AvailableCommands {
         commands: Vec<SlashCommand>,
     },
+    /// The OMP driver bound this run to a native session (handoff C2).
+    /// Engine-internal: stamped into the host-local binding store and the
+    /// run journal; never folded into docs (it carries a host-local
+    /// session file path, which must not sync). `binding.chat_id` is
+    /// empty on emission — the engine stamps the owning chat.
+    #[serde(rename_all = "camelCase")]
+    OmpSessionBound {
+        binding: crate::omp::OmpSessionBinding,
+    },
+    /// OMP extension presentation (notify/status/title/editor/open-url).
+    /// Engine-transient: journaled, never folded into docs.
+    #[serde(rename_all = "camelCase")]
+    OmpPresentation {
+        presentation: crate::omp::OmpPresentation,
+    },
+    /// A structured OMP session event that is not text/tool traffic:
+    /// auto-compaction, auto-retry, notices, cache warming, model /
+    /// thinking changes, goal and queue updates (W02 structured-part
+    /// preservation, C4). `kind` is the OMP event token; `native` is
+    /// the original payload preserved as-is — presentation layers pick
+    /// renderable fields, unknown kinds/fields survive for generic
+    /// inspection instead of being dropped by the normalizer.
+    #[serde(rename_all = "camelCase")]
+    OmpStructured {
+        kind: String,
+        native: serde_json::Value,
+    },
     Error {
         message: String,
     },
@@ -784,6 +842,7 @@ mod tests {
         assert!(json.get("attachments").is_none());
         // Populated lists round-trip.
         let req = RunRequest {
+            omp: None,
             attachments: vec!["/tmp/a.png".into()],
             ..req
         };
@@ -803,6 +862,7 @@ mod tests {
         assert!(json.get("worktree").is_none());
         // A populated spec round-trips camelCased.
         let req = RunRequest {
+            omp: None,
             worktree: Some(WorktreeSpec {
                 repo_path: "/repos/comet".into(),
                 base: "main".into(),
@@ -929,15 +989,20 @@ mod todo_item_tests {
     }
 
     #[test]
-    fn only_in_progress_adds_a_field_so_other_docs_are_unchanged() {
+    fn only_non_pending_states_add_a_field_so_other_docs_are_unchanged() {
         let pending = serde_json::to_value(TodoItem::new("a", TodoStatus::Pending)).unwrap();
         let done = serde_json::to_value(TodoItem::new("b", TodoStatus::Completed)).unwrap();
         let active = serde_json::to_value(TodoItem::new("c", TodoStatus::InProgress)).unwrap();
+        let blocked = serde_json::to_value(TodoItem::new("d", TodoStatus::Blocked)).unwrap();
         assert_eq!(pending, json!({ "text": "a", "done": false }));
         assert_eq!(done, json!({ "text": "b", "done": true }));
         assert_eq!(
             active,
             json!({ "text": "c", "done": false, "status": "inProgress" })
+        );
+        assert_eq!(
+            blocked,
+            json!({ "text": "d", "done": false, "status": "blocked" })
         );
     }
 
@@ -946,7 +1011,7 @@ mod todo_item_tests {
         let call: ToolCall = serde_json::from_value(json!({
             "kind": "todo",
             "items": [
-                { "text": "a", "done": false, "status": "blocked" },
+                { "text": "a", "done": false, "status": "deferred" },
                 { "text": "b", "done": true, "status": 7 },
             ]
         }))
@@ -964,6 +1029,8 @@ mod todo_item_tests {
             text: "a".into(),
             done: true,
             status: Some(TodoStatus::InProgress),
+            phase: None,
+            blocker: None,
         };
         assert_eq!(item.status(), TodoStatus::Completed);
     }

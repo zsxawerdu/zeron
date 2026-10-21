@@ -31,6 +31,7 @@ pub mod instance_lock;
 pub mod local_import;
 mod model_catalogs;
 pub mod profile;
+pub mod omp_bindings;
 pub mod project_actions;
 pub mod registry;
 pub mod repos;
@@ -231,6 +232,9 @@ impl EngineCore {
         let store_for_import = store.clone();
         let journal = Arc::new(RunJournal::open(profile.store_root().join("journals"))?);
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
+        sessions.set_omp_bindings(Arc::new(crate::omp_bindings::OmpBindingStore::open(
+            profile.store_root().join("omp-sessions.json"),
+        )));
         let doc_host = DocHost::new(
             store.clone(),
             DocHostConfig {

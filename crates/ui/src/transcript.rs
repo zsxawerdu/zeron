@@ -924,6 +924,8 @@ pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
                     zeron_proto::TodoStatus::Completed => "[x]",
                     zeron_proto::TodoStatus::InProgress => "[~]",
                     zeron_proto::TodoStatus::Pending => "[ ]",
+                    zeron_proto::TodoStatus::Blocked => "[!]",
+                    zeron_proto::TodoStatus::Abandoned => "[-]",
                 };
                 format!("{mark} {}", i.text)
             })
@@ -12757,6 +12759,7 @@ mod tests {
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
+            omp_entry_id: None,
         }
     }
 
@@ -12879,6 +12882,7 @@ mod tests {
             subagent_ref: Some(format!("chat--sub--{id}")),
             subagent_status: Some(SubagentStatus::Running),
             subagent_tail: None,
+            omp_entry_id: None,
         }
     }
 

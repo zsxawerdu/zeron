@@ -1472,7 +1472,9 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         methods::APPLY_HARNESS_UPDATE => Duration::from_secs(20 * 60),
         methods::CREATE_WORKTREE => Duration::from_secs(120),
         // Allow the adapter discovery budget plus relay and shutdown overhead.
-        methods::LIST_MODELS | methods::LIST_COMMANDS => Duration::from_secs(100),
+        methods::LIST_MODELS | methods::LIST_COMMANDS | methods::OMP_TOOL_DETAIL => {
+            Duration::from_secs(100)
+        }
         _ => Duration::from_secs(30),
     }
 }
@@ -1500,6 +1502,7 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_MODELS
             | methods::LIST_SKILLS
             | methods::LIST_COMMANDS
+            | methods::OMP_TOOL_DETAIL
             | methods::QUEUE_COMMAND
             | methods::TAKE_PROJECT_ACTION_SETUP
             | methods::WATCH_DOC_MESSAGES
@@ -1996,6 +1999,14 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&commands)
+            }
+            methods::OMP_TOOL_DETAIL => {
+                // Owner-authorized detail fetch (W02/C4): SessionsEngine
+                // serves only chats this host owns a binding for; every
+                // other outcome is explicit in the reply value itself.
+                let p: zeron_proto::omp::OmpToolDetailRequest = parse_params(params)?;
+                let detail = self.sessions.omp_tool_detail(p).await;
+                RpcReply::value(&detail)
             }
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;

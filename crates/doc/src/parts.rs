@@ -199,6 +199,11 @@ pub enum MessagePart {
         /// its tagged text deltas (capped; display-only).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subagent_tail: Option<String>,
+        /// OMP native session entry id that produced this tool call; the key
+        /// for owner-side full-detail fetch from OMP native history; None for
+        /// legacy (non-OMP) projections.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        omp_entry_id: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
     Input {
@@ -226,6 +231,18 @@ pub enum MessagePart {
         /// source does not rewrite history.
         source_title: String,
     },
+    /// A structured OMP session event preserved in order (W02/C4):
+    /// auto-compaction, auto-retry, notices, cache warming, model /
+    /// thinking / goal / queue updates. `kind` is the OMP event token
+    /// and `native` the original payload; renderers pick fields and
+    /// unknown kinds degrade to an invisible empty part on old builds
+    /// (unknown-kind fallback) rather than being dropped here.
+    #[serde(rename_all = "camelCase")]
+    OmpStructured {
+        id: String,
+        kind: String,
+        native: serde_json::Value,
+    },
 }
 
 impl MessagePart {
@@ -238,7 +255,8 @@ impl MessagePart {
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
             | MessagePart::Error { id, .. }
-            | MessagePart::Fork { id, .. } => id,
+            | MessagePart::Fork { id, .. }
+            | MessagePart::OmpStructured { id, .. } => id,
         }
     }
 
@@ -277,6 +295,9 @@ impl MessagePart {
                 source_title,
                 ..
             } => source_chat_id.len() + source_title.len(),
+            MessagePart::OmpStructured { kind, native, .. } => {
+                kind.len() + serde_json::to_vec(native).map_or(0, |v| v.len())
+            }
         }
     }
 }
@@ -379,6 +400,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     subagent_ref: None,
                     subagent_status: None,
                     subagent_tail: None,
+                    omp_entry_id: None,
                 });
             }
         }
@@ -521,6 +543,10 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         | AgentEvent::Usage { .. }
         | AgentEvent::ContextUsage { .. }
         | AgentEvent::AvailableCommands { .. }
+        // Engine-internal binding stamp; carries a host-local path and
+        // must never enter the synced projection.
+        | AgentEvent::OmpSessionBound { .. }
+        | AgentEvent::OmpPresentation { .. }
         | AgentEvent::UserMessage { .. } => {}
     }
 }
@@ -1007,6 +1033,7 @@ mod tests {
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
+                omp_entry_id: None,
             },
         ];
         let chunks = split_parts(&parts);

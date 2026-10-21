@@ -231,7 +231,9 @@ fn rig_full(adopts_config: bool, turn_boundary: bool) -> Rig {
 }
 
 fn request(prompt: &str) -> RunRequest {
+    omp: None,
     RunRequest {
+        omp: None,
         mcp: None,
         prompt: prompt.into(),
         harness: Some(HarnessId::Mock),

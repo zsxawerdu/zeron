@@ -275,6 +275,22 @@ pub trait Harness: Send + Sync {
         Err(HarnessError::Protocol("idle runtime unsupported".into()))
     }
 
+    /// Crash-recovery gate: may the engine re-dispatch `prompt` (the
+    /// crashed run's last user message) into the resumed native session
+    /// without duplicating it? The default keeps legacy revival semantics.
+    /// Runtimes with durable native admission (OMP) verify against native
+    /// history and answer `false` unless the prompt is provably absent —
+    /// including when verification itself fails: uncertain admission is
+    /// never blindly resent (OMP-only handoff C3).
+    async fn safe_to_redispatch(
+        &self,
+        _resume: &str,
+        _cwd: &std::path::Path,
+        _prompt: &str,
+    ) -> bool {
+        true
+    }
+
     /// Run one (persistent) session; the stream ends with `AgentEvent::Done`.
     async fn run(
         &self,
@@ -300,6 +316,7 @@ pub(crate) mod jsonrpc;
 pub mod mock;
 mod model_context;
 pub mod opencode;
+pub mod omp;
 pub mod pi;
 pub mod process;
 mod scratch;
@@ -323,6 +340,15 @@ pub fn compose_login_shell_path(cmd: &mut tokio::process::Command) {
 pub fn compose_child_path(cmd: &mut process::Command, exe: &std::path::Path) {
     compose_path(
         cmd.as_std_mut(),
+        exe.parent().filter(|d| !d.as_os_str().is_empty()),
+    );
+}
+
+/// [`compose_child_path`] for a std `Command` (the OMP client's spawn API
+/// takes one): same composition, direct handle.
+pub fn compose_std_child_path(cmd: &mut std::process::Command, exe: &std::path::Path) {
+    compose_path(
+        cmd,
         exe.parent().filter(|d| !d.as_os_str().is_empty()),
     );
 }
@@ -425,7 +451,7 @@ pub(crate) fn describe_exit(status: Option<std::process::ExitStatus>) -> String 
 }
 
 /// Remove recognizable credentials at the boundary where diagnostics become UI text.
-fn redact_secrets(text: &str) -> String {
+pub(crate) fn redact_secrets(text: &str) -> String {
     let lower = text.to_ascii_lowercase();
     let markers = ["bearer ", "basic ", "sk-", "ghp_", "xox", "api_key="];
     let mut result = String::new();
@@ -508,6 +534,7 @@ pub use codex::CodexHarness;
 pub use cursor::CursorHarness;
 pub use opencode::OpencodeHarness;
 pub use pi::PiHarness;
+pub use omp::{OmpApprovalMode, OmpExecutable, OmpHarness, OmpLaunch, OmpRuntime, OmpSession};
 
 // ---------------------------------------------------------------------------
 // Child lifecycle (shared by the codex and ACP harnesses)

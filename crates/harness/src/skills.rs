@@ -121,7 +121,9 @@ fn project_dirs(harness: HarnessId) -> &'static [&'static str] {
         HarnessId::Devin => &[".agents/skills"],
         HarnessId::Antigravity => &[".agents/skills", ".gemini/skills"],
         HarnessId::Codex => &[".agents/skills", ".codex/skills"],
-        HarnessId::Mock => &[],
+        // OMP skills/commands are runtime-discovered (get_available_commands);
+        // no filesystem skill dirs are scanned for it here.
+        HarnessId::Mock | HarnessId::Omp => &[],
     }
 }
 

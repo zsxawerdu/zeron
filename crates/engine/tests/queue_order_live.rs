@@ -118,7 +118,9 @@ impl Rig {
     }
 
     fn request(&self, prompt: String) -> RunRequest {
+        omp: None,
         RunRequest {
+            omp: None,
             mcp: None,
             prompt,
             harness: Some(self.id),

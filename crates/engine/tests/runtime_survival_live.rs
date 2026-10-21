@@ -98,7 +98,9 @@ fn run(
     harness: zeron_proto::HarnessId,
     cwd: &str,
 ) -> RunRequest {
+    omp: None,
     RunRequest {
+        omp: None,
         mcp: None,
         prompt: prompt.into(),
         harness: Some(harness),

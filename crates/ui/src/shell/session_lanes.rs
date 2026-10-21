@@ -743,6 +743,7 @@ mod tests {
             subagent_ref: doc.map(str::to_owned),
             subagent_status: status,
             subagent_tail: None,
+            omp_entry_id: None,
         }
     }
 

@@ -26,7 +26,9 @@ const CHAT: &str = "chat-e2e";
 const VIEWER: &str = "viewer-device";
 
 fn run_request(prompt: &str) -> RunRequest {
+    omp: None,
     RunRequest {
+        omp: None,
         mcp: None,
         prompt: prompt.into(),
         harness: None,
@@ -1299,6 +1301,7 @@ fn spawn_chip(id: &str, status: SubagentStatus) -> MessagePart {
         subagent_ref: Some(format!("{CHAT}--sub--{id}")),
         subagent_status: Some(status),
         subagent_tail: None,
+        omp_entry_id: None,
     }
 }
 
@@ -2429,6 +2432,7 @@ async fn real_claude_sees_uploaded_image_inline() {
          Attached images (local files — open them to view):\n- {path}"
     );
     let request = RunRequest {
+        omp: None,
         mcp: None,
         prompt,
         harness: None,

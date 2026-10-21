@@ -12,6 +12,7 @@ pub mod entities;
 pub mod file_mentions;
 pub mod invocation;
 pub mod motion;
+pub mod omp;
 pub mod preview;
 pub mod projectless;
 pub mod sidebar_pins;

@@ -146,7 +146,9 @@ impl Harness for RecordingHarness {
 }
 
 fn request(prompt: &str) -> RunRequest {
+    omp: None,
     RunRequest {
+        omp: None,
         mcp: None,
         prompt: prompt.into(),
         harness: None,

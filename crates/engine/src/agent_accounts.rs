@@ -3103,6 +3103,9 @@ fn harness_slug(harness: HarnessId) -> &'static str {
         HarnessId::Pi => "pi",
         HarnessId::Opencode => "opencode",
         HarnessId::Antigravity => "antigravity",
+        // Naming only: OMP credentials are OMP-owned; account-slot logic
+        // must never read or rewrite OMP credential storage.
+        HarnessId::Omp => "omp",
         HarnessId::Mock => "mock",
     }
 }

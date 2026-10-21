@@ -26,6 +26,7 @@ members = [
     "crates/visual",
     "crates/visual-gpu",
     "crates/zatex",
+    "crates/omp-rpc",
     "apps/zeron",
 ]
 
@@ -60,6 +61,8 @@ zeron-text = { path = "crates/text" }
 zatex = { path = "crates/zatex" }
 zeron-visual = { path = "crates/visual" }
 zeron-visual-gpu = { path = "crates/visual-gpu" }
+# Vendored official OMP RPC client (see crates/omp-rpc/VENDOR.md).
+omp-rpc = { path = "crates/omp-rpc" }
 
 # CRDT
 loro = "1.13"

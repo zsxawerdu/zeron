@@ -713,6 +713,24 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::PiHarness::new().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::PiHarness::new()) as Arc<dyn Harness>)),
     );
+    // OMP over its native `omp --mode rpc-ui` protocol — the sole runtime
+    // after the OMP-only cutover (docs/plans/2026-10-20-omp-only-handoff.md).
+    // Thinking levels are discovered per model; installation/update stay
+    // OMP-owned, so this is never installer-managed.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Omp,
+            name: "OMP".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            can_install: false,
+            enabled: None,
+        },
+        Box::new(|| zeron_harness::OmpHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::OmpHarness::new()) as Arc<dyn Harness>)),
+    );
     // opencode over its NATIVE HTTP/SSE protocol (the one the opencode
     // desktop app speaks — `opencode serve` + the /global/event bus), same
     // lazy pattern: the static descriptor mirrors OpencodeHarness exactly.
@@ -837,6 +855,7 @@ mod tests {
                 HarnessId::Grok,
                 HarnessId::Hermes,
                 HarnessId::Pi,
+                HarnessId::Omp,
                 HarnessId::Opencode,
                 HarnessId::Antigravity
             ]

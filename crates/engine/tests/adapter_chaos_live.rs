@@ -112,7 +112,9 @@ impl Suite {
     }
 
     fn request(&self, prompt: &str) -> RunRequest {
+        omp: None,
         RunRequest {
+            omp: None,
             mcp: None,
             prompt: prompt.into(),
             harness: Some(self.id),
@@ -1176,7 +1178,9 @@ fn send_to(core: &EngineCore, request: RunRequest) {
 }
 
 fn restart_request(name: &str, cwd: &str, prompt: &str) -> RunRequest {
+    omp: None,
     RunRequest {
+        omp: None,
         mcp: None,
         prompt: prompt.into(),
         harness: Some(harness(name).0),
