@@ -458,7 +458,14 @@ impl Render for AccountUsage {
             self.trigger(
                 chip,
                 FooterCard::Context,
-                move |_, cx| crate::context_usage::card(context, &Theme::of(cx).for_popup()),
+                move |this, cx| {
+                    let turn_usage = this.state.read(cx).turn_usage;
+                    crate::context_usage::card_with_turn_usage(
+                        context,
+                        turn_usage,
+                        &Theme::of(cx).for_popup(),
+                    )
+                },
                 cx,
             )
         });

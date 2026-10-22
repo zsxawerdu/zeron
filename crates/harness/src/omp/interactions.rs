@@ -2,10 +2,12 @@
 //!
 //! The domain [`OmpInteraction`] is the seam: wire requests convert into
 //! it losslessly (option descriptions/previews, multi-select, deadlines),
-//! and responses convert back. The engine's legacy `UserInputQuestion`
-//! bridge is one downstream projection of the domain type — labels only —
-//! until the W04 UI consumes `OmpInteraction` directly. Nothing is lost
-//! before that boundary, and cancellation always wins over a value.
+//! and responses convert back. The engine's `UserInputQuestion` bridge
+//! is one downstream projection of the domain type: labels remain the
+//! answer currency, and option descriptions/previews plus the
+//! recommended index ride along (W04) so the UI renders the full
+//! question. Nothing is lost before that boundary, and cancellation
+//! always wins over a value.
 
 use omp_rpc::wire::{ExtensionUiRequest, ExtensionUiResponse};
 use omp_rpc::wire;
@@ -194,8 +196,22 @@ pub fn to_interaction(request: &ExtensionUiRequest, generation: u64) -> Option<O
 /// lossy boundary until W04 UI lands). Question ids: `ask` keeps native
 /// per-question ids; single-dialog kinds use the request id.
 pub fn to_questions(interaction: &OmpInteraction) -> Vec<UserInputQuestion> {
-    let single = |options: Vec<String>, prefill: Option<String>, multiline: bool| {
+    let details = |options: &[OmpInteractionOption]| {
+        options
+            .iter()
+            .map(|option| zeron_proto::UserInputOptionDetail {
+                description: option.description.clone(),
+                preview: option.preview.clone(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let single = |options: Vec<String>,
+                  option_details: Vec<zeron_proto::UserInputOptionDetail>,
+                  prefill: Option<String>,
+                  multiline: bool| {
         vec![UserInputQuestion {
+            option_details,
+            recommended: None,
             id: interaction.request_id.clone(),
             header: "OMP".into(),
             question: match &interaction.message {
@@ -209,17 +225,44 @@ pub fn to_questions(interaction: &OmpInteraction) -> Vec<UserInputQuestion> {
         }]
     };
     match &interaction.kind {
-        OmpInteractionKind::Select { options } => single(
-            options.iter().map(|option| option.label.clone()).collect(),
-            None,
-            false,
-        ),
-        OmpInteractionKind::Confirm => single(vec!["Yes".into(), "No".into()], None, false),
-        OmpInteractionKind::Input { .. } => single(Vec::new(), None, false),
-        OmpInteractionKind::Editor { prefill } => single(Vec::new(), prefill.clone(), true),
+        OmpInteractionKind::Select { options } => {
+            // OMP tool approvals arrive as this select shape (Approve /
+            // Approve <tool> for this session / Deny, target+args in the
+            // title). When OMP gave no description, spell out the
+            // one-time vs standing-grant distinction (W04): a one-time
+            // approval must never read as a session grant.
+            let mut option_details = details(options);
+            for (option, detail) in options.iter().zip(option_details.iter_mut()) {
+                if detail.description.is_none() {
+                    detail.description = match option.label.as_str() {
+                        "Approve" => Some("Allow this one operation, this once".into()),
+                        "Deny" => Some("Do not run it".into()),
+                        label if label.starts_with("Approve ")
+                            && label.ends_with("for this session") =>
+                        {
+                            Some("Allow this tool for the rest of the session".into())
+                        }
+                        _ => None,
+                    };
+                }
+            }
+            single(
+                options.iter().map(|option| option.label.clone()).collect(),
+                option_details,
+                None,
+                false,
+            )
+        }
+        OmpInteractionKind::Confirm => single(vec!["Yes".into(), "No".into()], Vec::new(), None, false),
+        OmpInteractionKind::Input { .. } => single(Vec::new(), Vec::new(), None, false),
+        OmpInteractionKind::Editor { prefill } => {
+            single(Vec::new(), Vec::new(), prefill.clone(), true)
+        }
         OmpInteractionKind::Ask { questions } => questions
             .iter()
             .map(|question| UserInputQuestion {
+                option_details: details(&question.options),
+                recommended: question.recommended,
                 id: question.id.clone(),
                 header: question.header.clone().unwrap_or_else(|| "OMP".into()),
                 question: question.question.clone(),
@@ -378,6 +421,17 @@ mod tests {
 
         let questions = to_questions(&interaction);
         assert_eq!(questions[0].id, "q1");
+        // W04: the UI projection carries the rich fields, not just labels.
+        assert_eq!(
+            questions[0].option_details[0].description.as_deref(),
+            Some("first option")
+        );
+        assert_eq!(
+            questions[0].option_details[0].preview.as_deref(),
+            Some("preview text")
+        );
+        assert_eq!(questions[0].recommended, Some(0));
+        assert!(questions[0].multi_select);
         let response = from_answers(
             &interaction,
             &[UserInputAnswer {
@@ -392,6 +446,39 @@ mod tests {
         assert_eq!(answers[0].custom_input.as_deref(), Some("my own words"));
         let wire_back = to_wire_response("r9", response);
         assert!(matches!(wire_back, ExtensionUiResponse::AnswersUiResponse(_)));
+    }
+
+    #[test]
+    fn approval_options_spell_out_one_time_vs_session_grant() {
+        let interaction = to_interaction(
+            &ExtensionUiRequest::Select(SelectUiRequest {
+                id: "a1".into(),
+                title: "Run bash `ls`?".into(),
+                options: vec![
+                    "Approve".into(),
+                    "Approve bash for this session".into(),
+                    "Deny".into(),
+                ],
+                option_details: None,
+                timeout: None,
+            }),
+            1,
+        )
+        .unwrap();
+        let questions = to_questions(&interaction);
+        let descriptions: Vec<Option<&str>> = questions[0]
+            .option_details
+            .iter()
+            .map(|detail| detail.description.as_deref())
+            .collect();
+        assert_eq!(
+            descriptions,
+            vec![
+                Some("Allow this one operation, this once"),
+                Some("Allow this tool for the rest of the session"),
+                Some("Do not run it"),
+            ]
+        );
     }
 
     #[test]

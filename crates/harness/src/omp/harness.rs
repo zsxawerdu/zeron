@@ -33,7 +33,9 @@ use omp_rpc::wire::{
 };
 use omp_rpc::{Event, RpcInbound};
 use tokio::sync::{mpsc, oneshot};
-use zeron_proto::omp::{OmpModelRef, OmpSlashCommand};
+use zeron_proto::omp::{
+    OmpLoginProvider, OmpLogoutAccount, OmpLogoutOutcome, OmpModelRef, OmpSlashCommand,
+};
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
     UserInputAnswer, UserInputQuestion,
@@ -45,6 +47,11 @@ use crate::{Harness, HarnessError, RunControls, SteerMessage};
 
 type Input =
     dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync;
+
+/// Question bridge for OMP flows that run outside a chat turn (W05
+/// login): same shape as a run's `request_input` — questions in,
+/// answers back over a oneshot; dropping the receiver cancels.
+pub type OmpInputBridge = Arc<Input>;
 
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -221,10 +228,16 @@ impl OmpHarness {
 
     /// Providers OMP can log in to and their auth state, straight from
     /// OMP (`get_login_providers`). Discovery only — no login is started.
-    pub async fn login_providers(&self) -> Result<Vec<wire::LoginProvider>, HarnessError> {
+    pub async fn login_providers(&self) -> Result<Vec<OmpLoginProvider>, HarnessError> {
         let cwd = std::env::current_dir()?;
-        self.probe(cwd, |runtime| runtime.call(&wire::GetLoginProvidersCommand {}))
-            .await
+        self.probe(cwd, |runtime| {
+            Ok(runtime
+                .call(&wire::GetLoginProvidersCommand {})?
+                .iter()
+                .map(login_provider)
+                .collect())
+        })
+        .await
     }
 
     /// Stored credentials `logout` can remove for one provider, as OMP
@@ -233,13 +246,234 @@ impl OmpHarness {
     pub async fn logout_accounts(
         &self,
         provider_id: &str,
-    ) -> Result<Vec<wire::LogoutAccount>, HarnessError> {
+    ) -> Result<Vec<OmpLogoutAccount>, HarnessError> {
         let cwd = std::env::current_dir()?;
         let provider_id = provider_id.to_owned();
         self.probe(cwd, move |runtime| {
-            runtime.call(&wire::GetLogoutAccountsCommand { provider_id })
+            Ok(runtime
+                .call(&wire::GetLogoutAccountsCommand { provider_id })?
+                .iter()
+                .map(logout_account)
+                .collect())
         })
         .await
+    }
+
+    /// Remove one stored credential through OMP (`logout`). OMP owns
+    /// the credential store; Zeron never rewrites it directly. Fails
+    /// when the credential is no longer stored.
+    pub async fn logout(
+        &self,
+        provider_id: &str,
+        credential_id: i64,
+    ) -> Result<OmpLogoutOutcome, HarnessError> {
+        let cwd = std::env::current_dir()?;
+        let provider_id = provider_id.to_owned();
+        self.probe(cwd, move |runtime| {
+            let result = runtime.call(&wire::LogoutCommand {
+                provider_id,
+                credential_id,
+            })?;
+            Ok(OmpLogoutOutcome {
+                remaining_source: result.remaining_source,
+            })
+        })
+        .await
+    }
+
+    /// Onboarding readiness (W05): executable identity plus OMP's own
+    /// provider/auth discovery. A discovery failure is data, not an
+    /// error — onboarding renders `discovery_error` verbatim (missing
+    /// executable, unusable runtime, …) instead of a bare failure.
+    pub async fn readiness(&self) -> zeron_proto::omp::OmpReadiness {
+        use zeron_proto::omp::OmpReadiness;
+        let executable = match self.executable() {
+            Ok(executable) => executable,
+            Err(error) => {
+                return OmpReadiness {
+                    version: None,
+                    qualified: false,
+                    providers: Vec::new(),
+                    discovery_error: Some(error.to_string()),
+                };
+            }
+        };
+        let (version, qualified) = (
+            executable.version.as_ref().map(ToString::to_string),
+            executable.qualified(),
+        );
+        match self.login_providers().await {
+            Ok(providers) => OmpReadiness {
+                version,
+                qualified,
+                providers,
+                discovery_error: None,
+            },
+            Err(error) => OmpReadiness {
+                version,
+                qualified,
+                providers: Vec::new(),
+                discovery_error: Some(error.to_string()),
+            },
+        }
+    }
+
+    /// Run one provider login through OMP (`login`, W05). The OAuth
+    /// flow arrives as extension-UI requests on the same runtime:
+    /// `open_url` goes to `open_url` (http/https-gated at conversion),
+    /// questions go through `input` and are answered fail-closed —
+    /// a dropped/cancelled bridge answers `Cancelled`, never a value.
+    /// Runs on an ephemeral runtime: login works before any session
+    /// or selected model exists, which is the onboarding case.
+    /// Returns the provider id OMP reports as logged in.
+    pub async fn login(
+        &self,
+        provider_id: &str,
+        input: OmpInputBridge,
+        open_url: Arc<dyn Fn(String) + Send + Sync>,
+    ) -> Result<String, HarnessError> {
+        let executable = self.executable()?;
+        let cwd = std::env::current_dir()?;
+        let launch = self.launch(&cwd, OmpSession::Ephemeral);
+        let provider_id = provider_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut runtime = OmpRuntime::spawn(executable, &launch, next_generation())?;
+            let generation = runtime.generation();
+            let interrupt = crate::CancellationToken::new();
+            // Drain UI requests while the login call blocks: the
+            // server waits on our answers before it can finish.
+            let result = runtime.call_concurrent(
+                &wire::LoginCommand { provider_id },
+                |event, outbound| {
+                    if let Some(request) = extension_ui_request(event) {
+                        if let Some(presentation) =
+                            super::interactions::to_presentation(request)
+                        {
+                            if let zeron_proto::omp::OmpPresentation::OpenUrl {
+                                url,
+                                launch_url,
+                                ..
+                            } = presentation
+                            {
+                                open_url(launch_url.unwrap_or(url));
+                            }
+                            return;
+                        }
+                        handle_ui_request(
+                            request.clone(),
+                            generation,
+                            &input,
+                            outbound,
+                            &interrupt,
+                        );
+                    }
+                },
+            );
+            // The login call is over: any dialog still open is
+            // cancelled fail-closed, never left waiting on a runtime
+            // that is about to close.
+            interrupt.cancel();
+            let closed = runtime.close();
+            result.and_then(|value| closed.map(|()| value))
+        })
+        .await
+        .map_err(|error| HarnessError::Protocol(format!("OMP login task failed: {error}")))?
+    }
+
+    /// Persistent model-role snapshot (W05) from OMP's effective
+    /// config for `cwd`: assignments, cycle order, fallback chains,
+    /// default thinking level. Persistent layer only — reading it
+    /// never touches a live session.
+    pub async fn model_roles(
+        &self,
+        cwd: &Path,
+    ) -> Result<zeron_proto::omp::OmpModelRoles, HarnessError> {
+        let admin = self.model_admin()?;
+        let cwd = cwd.to_path_buf();
+        tokio::task::spawn_blocking(move || admin.model_roles(&cwd))
+            .await
+            .map_err(|error| HarnessError::Protocol(format!("OMP model admin task failed: {error}")))?
+    }
+
+    /// Assign a model selector to a role persistently (W05), or
+    /// clear it with `None`. Writes go through `omp config`; the
+    /// reply is the fresh snapshot. Live sessions are unaffected.
+    pub async fn set_model_role(
+        &self,
+        cwd: &Path,
+        role: &str,
+        selector: Option<&str>,
+    ) -> Result<zeron_proto::omp::OmpModelRoles, HarnessError> {
+        let admin = self.model_admin()?;
+        let cwd = cwd.to_path_buf();
+        let role = role.to_owned();
+        let selector = selector.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            admin.set_model_role(&cwd, &role, selector.as_deref())
+        })
+        .await
+        .map_err(|error| HarnessError::Protocol(format!("OMP model admin task failed: {error}")))?
+    }
+
+    /// Replace the persistent role cycle order (W05).
+    pub async fn set_cycle_order(
+        &self,
+        cwd: &Path,
+        order: &[String],
+    ) -> Result<zeron_proto::omp::OmpModelRoles, HarnessError> {
+        let admin = self.model_admin()?;
+        let cwd = cwd.to_path_buf();
+        let order = order.to_vec();
+        tokio::task::spawn_blocking(move || admin.set_cycle_order(&cwd, &order))
+            .await
+            .map_err(|error| HarnessError::Protocol(format!("OMP model admin task failed: {error}")))?
+    }
+
+    /// Replace one persistent fallback chain (W05); empty removes it.
+    pub async fn set_fallback_chain(
+        &self,
+        cwd: &Path,
+        key: &str,
+        chain: &[String],
+    ) -> Result<zeron_proto::omp::OmpModelRoles, HarnessError> {
+        let admin = self.model_admin()?;
+        let cwd = cwd.to_path_buf();
+        let key = key.to_owned();
+        let chain = chain.to_vec();
+        tokio::task::spawn_blocking(move || admin.set_fallback_chain(&cwd, &key, &chain))
+            .await
+            .map_err(|error| HarnessError::Protocol(format!("OMP model admin task failed: {error}")))?
+    }
+
+    /// Set the persistent default thinking level (W05).
+    pub async fn set_default_thinking(
+        &self,
+        cwd: &Path,
+        level: &str,
+    ) -> Result<zeron_proto::omp::OmpModelRoles, HarnessError> {
+        let admin = self.model_admin()?;
+        let cwd = cwd.to_path_buf();
+        let level = level.to_owned();
+        tokio::task::spawn_blocking(move || admin.set_default_thinking(&cwd, &level))
+            .await
+            .map_err(|error| HarnessError::Protocol(format!("OMP model admin task failed: {error}")))?
+    }
+
+    /// Provider usage limits as OMP accounts them (W05, `omp usage`).
+    pub async fn provider_limits(
+        &self,
+    ) -> Result<zeron_proto::omp::OmpProviderLimits, HarnessError> {
+        let admin = self.model_admin()?;
+        tokio::task::spawn_blocking(move || admin.provider_limits())
+            .await
+            .map_err(|error| HarnessError::Protocol(format!("OMP usage task failed: {error}")))?
+    }
+
+    fn model_admin(&self) -> Result<super::model_admin::OmpModelAdmin, HarnessError> {
+        Ok(super::model_admin::OmpModelAdmin::new(
+            self.executable()?,
+            self.profile.clone(),
+        ))
     }
 
     /// Fork a native session onto a new session file/id (OMP `fork`),
@@ -278,6 +512,26 @@ impl OmpHarness {
         })
         .await
         .unwrap_or_default()
+    }
+}
+
+fn login_provider(provider: &wire::LoginProvider) -> OmpLoginProvider {
+    OmpLoginProvider {
+        id: provider.id.clone(),
+        name: provider.name.clone(),
+        available: provider.available,
+        authenticated: provider.authenticated,
+    }
+}
+
+fn logout_account(account: &wire::LogoutAccount) -> OmpLogoutAccount {
+    OmpLogoutAccount {
+        credential_id: account.credential_id,
+        provider: account.provider.clone(),
+        label: account.label.clone(),
+        detail: account.detail.clone(),
+        kind: account.r#type.as_str().to_owned(),
+        active: account.active,
     }
 }
 
@@ -404,6 +658,33 @@ mod tests {
         ]);
         assert_eq!(last_user_text(&entries).as_deref(), Some("second"));
         assert_eq!(last_user_text(&[]), None);
+    }
+
+    #[test]
+    fn account_discovery_maps_to_proto_without_credential_material() {
+        let provider = login_provider(&wire::LoginProvider {
+            id: "anthropic".into(),
+            name: "Anthropic".into(),
+            available: true,
+            authenticated: false,
+        });
+        assert_eq!(provider.id, "anthropic");
+        assert!(provider.available && !provider.authenticated);
+        let account = logout_account(&wire::LogoutAccount {
+            credential_id: 3,
+            provider: "anthropic".into(),
+            label: "work".into(),
+            detail: "oauth".into(),
+            r#type: wire::LogoutAccountType::Oauth,
+            active: true,
+        });
+        assert_eq!(account.kind, "oauth");
+        assert_eq!(account.credential_id, 3);
+        assert!(account.active);
+        // The proto account carries labels only: no token/key fields
+        // exist to leak, which the serialized shape proves.
+        let json = serde_json::to_value(&account).unwrap();
+        assert!(json.get("token").is_none() && json.get("apiKey").is_none());
     }
 
     #[test]
@@ -868,6 +1149,16 @@ fn run_blocking(
                 }
             }
         }
+        // Host-routed word prediction (W07 ghost text): answered
+        // against the live runtime; any failure is no suggestion.
+        while let Some(request) = turn.take_predict_request() {
+            let _ = request.reply.send(
+                runtime
+                    .predict_word(&request.text, request.cursor)
+                    .ok()
+                    .flatten(),
+            );
+        }
         if !interrupted && interrupt.is_cancelled() {
             interrupted = true;
             let _ = runtime.abort();
@@ -1007,7 +1298,23 @@ fn handle_ui_request(
     let outbound = outbound.clone();
     let interrupt = interrupt.clone();
     std::thread::spawn(move || {
-        let mut answers_rx = (input)(questions);
+        // A panicking input bridge must answer Cancelled, never die
+        // silently and leave OMP waiting on this dialog forever.
+        let mut answers_rx = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (input)(questions)
+        })) {
+            Ok(rx) => rx,
+            Err(_) => {
+                tracing::error!("OMP input bridge panicked; cancelling interaction");
+                let _ = outbound.send(RpcInbound::ExtensionUiResponse(
+                    super::interactions::to_wire_response(
+                        &interaction.request_id,
+                        OmpInteractionResponse::Cancelled { timed_out: false },
+                    ),
+                ));
+                return;
+            }
+        };
         let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
         let mut timed_out = false;
         let answers: Option<Vec<UserInputAnswer>> = loop {

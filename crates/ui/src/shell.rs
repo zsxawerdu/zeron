@@ -46,6 +46,7 @@ use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
 use crate::settings::harnesses::HarnessesPage;
+use crate::settings::models::ModelsPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
@@ -545,6 +546,8 @@ pub enum SettingsSection {
     Harnesses,
     /// Per-provider CLI accounts (login, usage) — labeled "Accounts".
     Agents,
+    /// OMP model/role hub + onboarding/accounts (W05).
+    Models,
     Appearance,
     Files,
     Notifications,
@@ -559,13 +562,14 @@ pub enum SettingsSection {
 
 impl SettingsSection {
     /// Sections shown in Settings. `Agents` is a legacy Accounts route alias.
-    pub const ALL: [SettingsSection; 10] = [
+    pub const ALL: [SettingsSection; 11] = [
         SettingsSection::General,
         SettingsSection::Appearance,
         SettingsSection::Notifications,
         SettingsSection::Voice,
         SettingsSection::Shortcuts,
         SettingsSection::Harnesses,
+        SettingsSection::Models,
         SettingsSection::Devices,
         SettingsSection::Files,
         SettingsSection::Appshots,
@@ -604,6 +608,7 @@ impl SettingsSection {
             SettingsSection::Devices => "devices",
             SettingsSection::Harnesses => "providers",
             SettingsSection::Agents => "agents",
+            SettingsSection::Models => "models",
             SettingsSection::Appearance => "appearance",
             SettingsSection::Files => "files",
             SettingsSection::Notifications => "notifications",
@@ -621,6 +626,7 @@ impl SettingsSection {
             "devices" => SettingsSection::Devices,
             "providers" | "harnesses" => SettingsSection::Harnesses,
             "agents" => SettingsSection::Agents,
+            "models" => SettingsSection::Models,
             "appearance" => SettingsSection::Appearance,
             "files" => SettingsSection::Files,
             "notifications" => SettingsSection::Notifications,
@@ -646,6 +652,7 @@ impl SettingsSection {
             SettingsSection::Devices => "Devices",
             SettingsSection::Harnesses => "Providers",
             SettingsSection::Agents => "Accounts",
+            SettingsSection::Models => "Models",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Files => "Files",
             SettingsSection::Notifications => "Notifications",
@@ -2104,6 +2111,7 @@ pub struct Shell {
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
+    models_page: Option<Entity<ModelsPage>>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
     files_settings_sub: Option<Subscription>,
@@ -2628,6 +2636,7 @@ impl Shell {
             shortcuts_page: None,
             accounts_page: None,
             harnesses_page: None,
+            models_page: None,
             shortcuts_sub: None,
             notifications_sub: None,
             files_settings_sub: None,
@@ -2848,6 +2857,35 @@ impl Shell {
         }
         if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
             self.show_notice(crate::toast::ToastKind::Info, notice, cx);
+        }
+        // One-shot OMP presentation effects (W04): fire exactly once —
+        // a notification becomes a toast, a URL opens in the browser
+        // (already scheme-gated at the driver), editor text replaces
+        // the composer draft. Status/widget/title live on AppState and
+        // render as the composer's extension strip.
+        for presentation in state.update(cx, |state, _| state.take_omp_presentations()) {
+            use zeron_proto::omp::{OmpNotifyKind, OmpPresentation as P};
+            match presentation {
+                P::Notify { message, kind } => {
+                    let toast_kind = match kind {
+                        Some(OmpNotifyKind::Error) => crate::toast::ToastKind::Error,
+                        Some(OmpNotifyKind::Warning) => crate::toast::ToastKind::Info,
+                        _ => crate::toast::ToastKind::Info,
+                    };
+                    self.show_notice(toast_kind, message, cx);
+                }
+                P::OpenUrl {
+                    url, launch_url, ..
+                } => {
+                    cx.open_url(launch_url.as_deref().unwrap_or(&url));
+                }
+                P::EditorText { text } => {
+                    self.composer.update(cx, |composer, cx| {
+                        composer.set_editor_text(text, cx);
+                    });
+                }
+                P::Status { .. } | P::Widget { .. } | P::Title { .. } => {}
+            }
         }
         let next_sync_flow = {
             let state = state.read(cx);
@@ -4477,6 +4515,7 @@ impl Shell {
                         replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&entries)),
                         frame: zeron_doc::TranscriptFrame::Reset { reset: entries },
                         context_usage: None,
+                        turn_usage: None,
                     };
                     let prepared = crate::transcript::TranscriptPreparation::default()
                         .prepare(&update)
@@ -5404,6 +5443,9 @@ impl Shell {
         if section == SettingsSection::Harnesses {
             self.harnesses_page = None;
         }
+        if section == SettingsSection::Models {
+            self.models_page = None;
+        }
         if !matches!(self.route, Route::Settings(_)) {
             self.settings_focus_pending = true;
             self.settings_return_route = self.route;
@@ -5599,6 +5641,16 @@ impl Shell {
                     self.harnesses_page = Some(cx.new(|cx| HarnessesPage::new(state, cx)));
                 }
                 match &self.harnesses_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Models => {
+                if self.models_page.is_none() {
+                    let state = self.state.clone();
+                    self.models_page = Some(cx.new(|cx| ModelsPage::new(state, cx)));
+                }
+                match &self.models_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -7916,6 +7968,7 @@ impl Shell {
             SettingsSection::Devices => icons::MONITOR,
             SettingsSection::Harnesses => icons::WIDGET,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
+            SettingsSection::Models => icons::WIDGET,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Files => icons::FOLDER,
             SettingsSection::Notifications => icons::BELL,

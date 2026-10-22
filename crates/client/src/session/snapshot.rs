@@ -104,6 +104,7 @@ pub struct SessionSnapshot {
     /// `entries[transcript_len..]` (same order, same ids).
     pub pending: Vec<PendingSend>,
     pub context_usage: Option<ContextUsage>,
+    pub turn_usage: Option<zeron_proto::TurnUsage>,
     /// Content is present (local snapshot loaded or first sync landed). False
     /// = show a loader, not an empty chat.
     pub hydrated: bool,
@@ -299,4 +300,5 @@ pub struct ComposerState {
     /// The last message this device submitted (scroll-to-own-send target).
     pub last_submitted_message_id: Option<String>,
     pub context_usage: Option<ContextUsage>,
+    pub turn_usage: Option<zeron_proto::TurnUsage>,
 }

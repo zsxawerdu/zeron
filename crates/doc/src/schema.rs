@@ -420,6 +420,46 @@ impl SessionDoc {
         Ok(())
     }
 
+    /// Latest assistant message's token + cost usage (W07 footer
+    /// status), stored like `contextUsage`: one atomic JSON value.
+    pub fn turn_usage(&self) -> Option<zeron_proto::TurnUsage> {
+        let loro::ValueOrContainer::Value(LoroValue::String(value)) =
+            self.doc.get_map("meta").get("turnUsage")?
+        else {
+            return None;
+        };
+        serde_json::from_str(&value).ok()
+    }
+
+    /// Record the latest message's tokens; cost is preserved unless
+    /// a new one is reported (token and cost events arrive separately).
+    pub fn update_turn_usage(
+        &self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_usd: Option<f64>,
+    ) -> Result<(), DocError> {
+        let previous = self.turn_usage().unwrap_or_default();
+        let next = zeron_proto::TurnUsage {
+            input_tokens,
+            output_tokens,
+            cost_usd: cost_usd.or(previous.cost_usd),
+        };
+        if next != previous {
+            self.doc
+                .get_map("meta")
+                .insert("turnUsage", serde_json::to_string(&next)?)?;
+            self.doc.commit();
+        }
+        Ok(())
+    }
+
+    /// Attach a reported cost to the latest turn usage (W07).
+    pub fn update_turn_cost(&self, cost_usd: f64) -> Result<(), DocError> {
+        let previous = self.turn_usage().unwrap_or_default();
+        self.update_turn_usage(previous.input_tokens, previous.output_tokens, Some(cost_usd))
+    }
+
     /// The provider session that received a fork's copied history — a side
     /// chat's bootstrap is owed to any other session it continues in.
     pub fn fork_history_session(&self) -> Option<String> {

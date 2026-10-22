@@ -206,6 +206,117 @@ async fn list_inner(
     Ok(catalog.models)
 }
 
+/// Full-fidelity OMP descriptor catalog for the model hub (W05),
+/// with a last-known disk cache scoped by binary version + profile
+/// config context (the harness's `model_context`). Live success
+/// refreshes the cache and answers `stale: false`; any live failure
+/// answers the cached descriptors with `stale: true` and the live
+/// error attached, or — with no cache — an empty, explicitly
+/// unavailable snapshot. There is no fabricated static fallback.
+pub(crate) async fn omp_catalog(root: &Path) -> zeron_proto::omp::OmpCatalogSnapshot {
+    use zeron_proto::omp::OmpCatalogSnapshot;
+    let harness = zeron_harness::OmpHarness::new();
+    let context = zeron_harness::Harness::model_context(&harness)
+        .ok()
+        .flatten();
+    let path = context.as_ref().map(|context| {
+        root.join("model-catalogs")
+            .join("omp-descriptors")
+            .join(format!("{}.json", context.hash))
+    });
+    let cached = path
+        .as_ref()
+        .and_then(|path| read_omp(path, context.as_ref()));
+    match harness.omp_models().await {
+        Ok(models) if !models.is_empty() => {
+            if let (Some(path), Some(context)) = (&path, &context) {
+                if let Err(error) = save_omp(path, context, &models) {
+                    tracing::warn!(%error, "Could not persist OMP model catalog");
+                }
+            }
+            OmpCatalogSnapshot {
+                models,
+                stale: false,
+                error: None,
+            }
+        }
+        Ok(_) => match cached {
+            Some(models) => OmpCatalogSnapshot {
+                models,
+                stale: true,
+                error: Some("OMP returned no models; showing the last-known catalog".into()),
+            },
+            None => OmpCatalogSnapshot {
+                models: Vec::new(),
+                stale: false,
+                error: Some("OMP returned no models for this profile".into()),
+            },
+        },
+        Err(error) => match cached {
+            Some(models) => OmpCatalogSnapshot {
+                models,
+                stale: true,
+                error: Some(error.to_string()),
+            },
+            None => OmpCatalogSnapshot {
+                models: Vec::new(),
+                stale: false,
+                error: Some(error.to_string()),
+            },
+        },
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedOmp {
+    binary_version: Option<String>,
+    catalog: Vec<zeron_proto::omp::OmpModelDescriptor>,
+}
+
+fn read_omp(
+    path: &Path,
+    context: Option<&ModelContext>,
+) -> Option<Vec<zeron_proto::omp::OmpModelDescriptor>> {
+    let saved: SavedOmp = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let context = context?;
+    (saved.binary_version == context.binary_version && !saved.catalog.is_empty())
+        .then_some(saved.catalog)
+}
+
+fn save_omp(
+    path: &Path,
+    context: &ModelContext,
+    models: &[zeron_proto::omp::OmpModelDescriptor],
+) -> std::io::Result<()> {
+    if models.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let bytes = serde_json::to_vec(&SavedOmp {
+        binary_version: context.binary_version.clone(),
+        catalog: models.to_vec(),
+    })?;
+    let staging = path.with_extension(format!("{}.partial", uuid::Uuid::new_v4()));
+    let result = (|| {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&staging)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&staging, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,6 +555,32 @@ mod tests {
         let (result, _) = tokio::join!(list(dir.path(), probe.clone(), false), swap);
         assert!(result.is_err());
         assert!(!dir.path().join("model-catalogs").exists());
+    }
+
+    #[test]
+    fn saved_omp_catalog_roundtrip_scoped_by_binary_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("omp.json");
+        let context = context("first");
+        let descriptor = zeron_proto::omp::OmpModelDescriptor {
+            model: zeron_proto::omp::OmpModelRef::new("prov", "future-1"),
+            label: "Future".into(),
+            description: None,
+            reasoning: true,
+            thinking_levels: vec![zeron_proto::omp::OmpThinkingLevel::new("xhigh")],
+            input_modalities: vec!["text".into()],
+            context_window: Some(1000),
+            max_output_tokens: None,
+            native: serde_json::json!({"kind": "chat", "futureField": 1}),
+        };
+        assert!(read_omp(&path, Some(&context)).is_none());
+        save_omp(&path, &context, &[descriptor.clone()]).unwrap();
+        // Unknown native metadata survives the cache round-trip.
+        assert_eq!(read_omp(&path, Some(&context)), Some(vec![descriptor]));
+        let mut wrong = context.clone();
+        wrong.binary_version = Some("2.0.0".into());
+        assert!(read_omp(&path, Some(&wrong)).is_none());
+        assert!(read_omp(&path, None).is_none());
     }
 
     #[test]

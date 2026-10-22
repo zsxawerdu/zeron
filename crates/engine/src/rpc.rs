@@ -95,6 +95,92 @@ struct ChatParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct OmpProviderParams {
+    provider_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OmpLogoutParams {
+    provider_id: String,
+    credential_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OmpRolesParams {
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OmpSetRoleParams {
+    #[serde(default)]
+    cwd: Option<String>,
+    role: String,
+    #[serde(default)]
+    selector: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OmpSetCycleParams {
+    #[serde(default)]
+    cwd: Option<String>,
+    roles: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OmpSetFallbackParams {
+    #[serde(default)]
+    cwd: Option<String>,
+    key: String,
+    chain: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OmpSetThinkingParams {
+    #[serde(default)]
+    cwd: Option<String>,
+    level: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OmpLoginIdParams {
+    login_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OmpLoginAnswerParams {
+    login_id: String,
+    answers: Vec<zeron_proto::UserInputAnswer>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OmpPredictParams {
+    chat_id: String,
+    text: String,
+    cursor: i64,
+}
+
+/// Effective-config cwd for role admin: the caller's project dir
+/// when given (project layer included in effective reads), else
+/// the engine's own cwd.
+fn omp_roles_cwd(cwd: Option<String>) -> std::path::PathBuf {
+    cwd.filter(|cwd| !cwd.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ListModelsParams {
     harness: HarnessId,
     #[serde(default)]
@@ -1503,6 +1589,7 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_SKILLS
             | methods::LIST_COMMANDS
             | methods::OMP_TOOL_DETAIL
+            | methods::WATCH_OMP_PRESENTATION
             | methods::QUEUE_COMMAND
             | methods::TAKE_PROJECT_ACTION_SETUP
             | methods::WATCH_DOC_MESSAGES
@@ -1607,6 +1694,7 @@ fn is_stream_method(method: &str) -> bool {
         method,
         methods::WATCH_DOC_MESSAGES
             | methods::WATCH_QUEUE
+            | methods::WATCH_OMP_PRESENTATION
             | methods::SUBSCRIBE_TERMINAL
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::WATCH_WORKSPACE_GIT_STATUS
@@ -1649,9 +1737,10 @@ fn doc_messages_stream(
             None::<crate::doc_host::TranscriptSnapshot>,
             doc,
             None,
+            None,
             zeron_doc::TranscriptBaseline::default(),
         ),
-        |(mut rx, mut prev, doc, mut previous_usage, mut opening_baseline)| async move {
+        |(mut rx, mut prev, doc, mut previous_usage, mut previous_turn_usage, mut opening_baseline)| async move {
             loop {
                 if prev.is_some() {
                     rx.changed().await.ok()?;
@@ -1695,17 +1784,23 @@ fn doc_messages_stream(
                 // No-op commits (a second watcher attaching, command-only
                 // changes) produce empty deltas — skip the frame entirely.
                 let usage = doc.context_usage();
-                if frame.is_empty_delta() && usage == previous_usage && replay_baseline.is_none() {
+                if frame.is_empty_delta()
+                    && usage == previous_usage
+                    && doc.turn_usage() == previous_turn_usage
+                    && replay_baseline.is_none()
+                {
                     continue;
                 }
+                previous_turn_usage = doc.turn_usage();
                 previous_usage = usage;
                 let value = serde_json::to_value(zeron_doc::TranscriptUpdate {
                     frame,
                     context_usage: usage,
+                    turn_usage: doc.turn_usage(),
                     replay_baseline,
                 })
                 .ok()?;
-                return Some((value, (rx, prev, doc, previous_usage, opening_baseline)));
+                return Some((value, (rx, prev, doc, previous_usage, previous_turn_usage, opening_baseline)));
             }
         },
     )
@@ -1724,6 +1819,7 @@ async fn opening_doc_messages_stream(
         let mut preview = serde_json::to_value(zeron_doc::TranscriptUpdate {
             frame: zeron_doc::TranscriptFrame::reset(&entries),
             context_usage: handle.doc().context_usage(),
+            turn_usage: handle.doc().turn_usage(),
             replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&entries)),
         })
         .map_err(|e| crate::EngineError::Other(e.to_string()))?;
@@ -1733,7 +1829,6 @@ async fn opening_doc_messages_stream(
     .await
     .map_err(|e| RpcError::Failed(e.to_string()))?
     .map_err(|e| RpcError::Failed(e.to_string()))?;
-    // Do not build the full mirror before yielding the preview.
     // The next poll attaches normally and begins with a complete
     // authoritative reset; subsequent frames use normal deltas.
     let full = futures::stream::once(async move {
@@ -2007,6 +2102,175 @@ impl RpcService for EngineRpc {
                 let p: zeron_proto::omp::OmpToolDetailRequest = parse_params(params)?;
                 let detail = self.sessions.omp_tool_detail(p).await;
                 RpcReply::value(&detail)
+            }
+            methods::OMP_READINESS => {
+                let readiness = self.sessions.omp_readiness().await;
+                RpcReply::value(&readiness)
+            }
+            methods::OMP_LOGIN_PROVIDERS => {
+                let providers = self
+                    .sessions
+                    .omp_login_providers()
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&providers)
+            }
+            methods::OMP_LOGOUT_ACCOUNTS => {
+                let p: OmpProviderParams = parse_params(params)?;
+                let accounts = self
+                    .sessions
+                    .omp_logout_accounts(&p.provider_id)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&accounts)
+            }
+            methods::OMP_LOGOUT => {
+                let p: OmpLogoutParams = parse_params(params)?;
+                let outcome = self
+                    .sessions
+                    .omp_logout(&p.provider_id, p.credential_id)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&outcome)
+            }
+            methods::OMP_MODELS => {
+                let snapshot = crate::model_catalogs::omp_catalog(self.repos.data_dir()).await;
+                RpcReply::value(&snapshot)
+            }
+            methods::OMP_PREDICT_WORD => {
+                let p: OmpPredictParams = parse_params(params)?;
+                let suffix = self
+                    .sessions
+                    .omp_predict_word(&p.chat_id, p.text, p.cursor)
+                    .await;
+                RpcReply::value(&serde_json::json!({ "suffix": suffix }))
+            }
+            methods::OMP_COMMANDS => {
+                let p: OmpRolesParams = parse_params(params)?;
+                let commands = self
+                    .sessions
+                    .omp_commands(&omp_roles_cwd(p.cwd))
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&commands)
+            }
+            methods::OMP_MODEL_ROLES => {
+                let p: OmpRolesParams = parse_params(params)?;
+                let roles = self
+                    .sessions
+                    .omp_model_roles(&omp_roles_cwd(p.cwd))
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&roles)
+            }
+            methods::OMP_SET_MODEL_ROLE => {
+                let p: OmpSetRoleParams = parse_params(params)?;
+                let roles = self
+                    .sessions
+                    .omp_set_model_role(
+                        &omp_roles_cwd(p.cwd),
+                        &p.role,
+                        p.selector.as_deref(),
+                    )
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&roles)
+            }
+            methods::OMP_SET_CYCLE_ORDER => {
+                let p: OmpSetCycleParams = parse_params(params)?;
+                let roles = self
+                    .sessions
+                    .omp_set_cycle_order(&omp_roles_cwd(p.cwd), &p.roles)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&roles)
+            }
+            methods::OMP_SET_FALLBACK_CHAIN => {
+                let p: OmpSetFallbackParams = parse_params(params)?;
+                let roles = self
+                    .sessions
+                    .omp_set_fallback_chain(&omp_roles_cwd(p.cwd), &p.key, &p.chain)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&roles)
+            }
+            methods::OMP_SET_DEFAULT_THINKING => {
+                let p: OmpSetThinkingParams = parse_params(params)?;
+                let roles = self
+                    .sessions
+                    .omp_set_default_thinking(&omp_roles_cwd(p.cwd), &p.level)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&roles)
+            }
+            methods::OMP_PROVIDER_LIMITS => {
+                let limits = self
+                    .sessions
+                    .omp_provider_limits()
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&limits)
+            }
+            methods::OMP_LOGIN_START => {
+                let p: OmpProviderParams = parse_params(params)?;
+                let login_id = self.sessions.omp_login_start(&p.provider_id);
+                RpcReply::value(&serde_json::json!({ "loginId": login_id }))
+            }
+            methods::OMP_LOGIN_POLL => {
+                let p: OmpLoginIdParams = parse_params(params)?;
+                match self.sessions.omp_login_poll(&p.login_id) {
+                    Some(poll) => RpcReply::value(&poll),
+                    None => {
+                        return Err(RpcError::Failed(format!(
+                            "unknown OMP login: {}",
+                            p.login_id
+                        )));
+                    }
+                }
+            }
+            methods::OMP_LOGIN_ANSWER => {
+                let p: OmpLoginAnswerParams = parse_params(params)?;
+                let accepted = self.sessions.omp_login_answer(&p.login_id, p.answers);
+                RpcReply::value(&serde_json::json!({ "accepted": accepted }))
+            }
+            methods::OMP_LOGIN_CANCEL => {
+                let p: OmpLoginIdParams = parse_params(params)?;
+                let cancelled = self.sessions.omp_login_cancel(&p.login_id);
+                RpcReply::value(&serde_json::json!({ "cancelled": cancelled }))
+            }
+            methods::WATCH_OMP_PRESENTATION => {
+                // Transient extension presentation (W04): fire-and-forget
+                // frames, no replay and no first frame — a viewport that
+                // subscribes late misses what already happened, exactly
+                // like a missed toast.
+                let p: ChatParams = parse_params(params)?;
+                let rx = self.sessions.subscribe_presentations(&p.chat_id);
+                Ok(RpcReply::Stream(
+                    futures::stream::unfold(rx, |mut rx| async move {
+                        loop {
+                            match rx.recv().await {
+                                Ok(presentation) => {
+                                    let value = match serde_json::to_value(&presentation) {
+                                        Ok(value) => {
+                                            serde_json::json!({ "presentation": value })
+                                        }
+                                        Err(_) => continue,
+                                    };
+                                    return Some((value, rx));
+                                }
+                                // A slow viewport skips overflowed
+                                // frames; presentations are transient.
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                    continue;
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    return None;
+                                }
+                            }
+                        }
+                    })
+                    .boxed(),
+                ))
             }
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;

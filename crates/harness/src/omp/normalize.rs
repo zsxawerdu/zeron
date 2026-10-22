@@ -222,6 +222,11 @@ impl Normalizer {
                         input_tokens: input,
                         output_tokens: output,
                     });
+                    // Cost rides its own event: only runtimes that
+                    // actually report it may produce one (W07).
+                    if let Some(cost) = usage.cost.as_ref().and_then(|cost| cost.total) {
+                        events.push(AgentEvent::TurnCost { cost_usd: cost });
+                    }
                     events.push(AgentEvent::ContextUsage {
                         tokens: Some(count(usage.context_tokens).max(input + output)),
                         window: self.window,

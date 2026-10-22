@@ -570,6 +570,19 @@ pub struct ToolDiff {
     pub new_text: String,
 }
 
+/// Rich per-option metadata aligned by index with
+/// [`UserInputQuestion::options`] (W04): the OMP-supplied description
+/// and preview for each label. Labels stay the answer currency; this
+/// is presentation fidelity the label list alone cannot carry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInputOptionDetail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputQuestion {
@@ -577,6 +590,15 @@ pub struct UserInputQuestion {
     pub header: String,
     pub question: String,
     pub options: Vec<String>,
+    /// Per-option rich metadata, aligned by index with `options`;
+    /// shorter than `options` when the source gave none (additive —
+    /// older payloads omit it entirely).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub option_details: Vec<UserInputOptionDetail>,
+    /// Index into `options` of the recommended choice, when the
+    /// runtime named one (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended: Option<u32>,
     #[serde(default)]
     pub multi_select: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -674,6 +696,14 @@ pub enum AgentEvent {
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+    },
+    /// Monetary cost of one assistant message, when the runtime
+    /// reports it (OMP `usage.cost.total`). Separate from [`Self::Usage`]
+    /// so token-only drivers never fabricate a cost. Engine-transient
+    /// like `ContextUsage`: folded into doc meta, never into parts.
+    #[serde(rename_all = "camelCase")]
+    TurnCost {
+        cost_usd: f64,
     },
     /// The agent advertised (or changed) its slash-command set — ACP
     /// `available_commands_update`. The engine caches the latest list per
@@ -953,6 +983,18 @@ impl ContextUsage {
     pub fn fraction(self) -> Option<f64> {
         Some(self.tokens? as f64 / self.window.filter(|n| *n > 0)? as f64)
     }
+}
+
+/// Token + cost usage of the latest assistant message (W07 status):
+/// what the footer shows next to context occupancy. `cost_usd` is
+/// present only when the runtime reports cost — never estimated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 #[cfg(test)]

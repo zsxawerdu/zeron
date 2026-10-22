@@ -3099,6 +3099,8 @@ fn handle_server_request_live(
         })
         .collect();
     let question = UserInputQuestion {
+        option_details: Vec::new(),
+        recommended: None,
         id: new_message_id(),
         header: "Agent question".into(),
         question: params

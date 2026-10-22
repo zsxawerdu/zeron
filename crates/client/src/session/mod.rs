@@ -164,6 +164,7 @@ struct CoreState {
     queue: Vec<QueuedMessage>,
     commands: Vec<SessionCommandEntry>,
     context_usage: Option<ContextUsage>,
+    turn_usage: Option<zeron_proto::TurnUsage>,
     /// Stable echo entries by message id.
     echoes: HashMap<String, Arc<Entry>>,
     pending: Vec<PendingSend>,
@@ -238,6 +239,7 @@ impl SessionCore {
                 queue: Vec::new(),
                 commands: Vec::new(),
                 context_usage: None,
+                turn_usage: None,
                 echoes: HashMap::new(),
                 pending: Vec::new(),
                 grace_started: HashMap::new(),
@@ -454,6 +456,7 @@ impl SessionCore {
             }
             if dirty.meta {
                 st.context_usage = self.doc.context_usage();
+                st.turn_usage = self.doc.turn_usage();
             }
             let echoes_changed = derive_pending(&mut st, &client.config.device_id, degraded, now);
             send_after = oldest_state(&st.pending);
@@ -549,6 +552,7 @@ impl SessionCore {
             queue_error: st.queue_error.clone(),
             last_submitted_message_id: st.last_submitted.clone(),
             context_usage: st.context_usage,
+            turn_usage: st.turn_usage,
         };
         let current = self.composer();
         next.revision = current.revision;
@@ -644,6 +648,7 @@ fn empty_composer(chat_id: &str) -> ComposerState {
         queue_error: None,
         last_submitted_message_id: None,
         context_usage: None,
+        turn_usage: None,
     }
 }
 
@@ -868,6 +873,7 @@ fn build_snapshot(
         working_since_ms: live.working_since_ms,
         pending: st.pending.clone(),
         context_usage: st.context_usage,
+        turn_usage: st.turn_usage,
         hydrated: st.hydrated,
         delta: SnapshotDelta::default(),
         index: Arc::new(index),

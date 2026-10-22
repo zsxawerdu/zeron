@@ -706,13 +706,58 @@ impl Wizard {
             .iter()
             .map(|q| q.prefill.clone().unwrap_or_default())
             .collect();
+        // A runtime-named recommended option starts picked on
+        // single-select pages (W04): it renders highlighted and the
+        // user can change it like any other pick.
+        let picked = questions
+            .iter()
+            .map(|q| match q.recommended {
+                Some(ix) if !q.multi_select && (ix as usize) < q.options.len() => {
+                    vec![ix as usize]
+                }
+                _ => Vec::new(),
+            })
+            .collect();
         Self {
             request_id,
             questions,
             page: 0,
-            picked: vec![Vec::new(); n],
+            picked,
             typed,
         }
+    }
+
+    /// Whether the current page is an OMP tool approval (W04): the
+    /// select shape `Approve` / `Approve … for this session` / `Deny`.
+    /// Approvals get a dedicated card — the operation under approval
+    /// rendered as a code block, not a generic question — because the
+    /// decision is one-time vs standing permission, not a preference.
+    pub fn is_approval_page(&self) -> bool {
+        let Some(question) = self.current() else {
+            return false;
+        };
+        let labels: Vec<&str> = question.options.iter().map(String::as_str).collect();
+        labels.last() == Some(&"Deny")
+            && labels
+                .first()
+                .is_some_and(|first| *first == "Approve" || first.starts_with("Approve "))
+    }
+
+    /// Rich metadata for one option of the current page: description,
+    /// preview, and whether it is the recommended pick (W04).
+    pub fn option_meta(
+        &self,
+        option_ix: usize,
+    ) -> (Option<&str>, Option<&str>, bool) {
+        let Some(question) = self.current() else {
+            return (None, None, false);
+        };
+        let detail = question.option_details.get(option_ix);
+        (
+            detail.and_then(|d| d.description.as_deref()),
+            detail.and_then(|d| d.preview.as_deref()),
+            question.recommended == Some(option_ix as u32),
+        )
     }
 
     pub fn counter(&self) -> String {
@@ -5929,6 +5974,62 @@ fn invocation_candidates(
         .collect()
 }
 
+/// Slash candidates from the FAITHFUL OMP command list (W07):
+/// canonical names, alias rows (invoking the alias OMP resolves),
+/// subcommand names in the description, source suffix for
+/// non-builtin commands, and argument hints. Alias rows invoke the
+/// canonical command so an accepted candidate never sends a name
+/// the runtime would not resolve the same way. Pure.
+pub fn omp_slash_candidates(
+    commands: &[zeron_proto::omp::OmpSlashCommand],
+) -> Vec<SlashCommand> {
+    let mut rows: Vec<SlashCommand> = Vec::new();
+    for command in commands {
+        if !zeron_proto::invocation::valid_invocation_name(&command.name) {
+            continue;
+        }
+        let mut description = command.description.clone();
+        if !command.subcommands.is_empty() {
+            let subs: Vec<&str> = command
+                .subcommands
+                .iter()
+                .map(|sub| sub.name.as_str())
+                .collect();
+            if !description.is_empty() {
+                description.push_str(" · ");
+            }
+            description.push_str(&format!("subcommands: {}", subs.join(", ")));
+        }
+        if command.source != "builtin" && !command.source.is_empty() {
+            description.push_str(&format!(" · {}", command.source));
+        }
+        let input_hint = command.input_hint.clone().or_else(|| {
+            command
+                .subcommands
+                .first()
+                .and_then(|sub| sub.usage.clone())
+        });
+        rows.push(SlashCommand {
+            name: command.name.clone(),
+            description: description.clone(),
+            input_hint: input_hint.clone(),
+        });
+        for alias in &command.aliases {
+            if !zeron_proto::invocation::valid_invocation_name(alias)
+                || rows.iter().any(|row| &row.name == alias)
+            {
+                continue;
+            }
+            rows.push(SlashCommand {
+                name: alias.clone(),
+                description: format!("Alias of /{} — {}", command.name, command.description),
+                input_hint: input_hint.clone(),
+            });
+        }
+    }
+    rows
+}
+
 fn merge_invocation_results(
     commands: Result<Vec<SlashCommand>, RpcError>,
     skills: Result<Option<Vec<zeron_proto::invocation::Skill>>, RpcError>,
@@ -6014,6 +6115,9 @@ pub struct Composer {
     mention: FileMentionState,
     slash_task: Option<Task<()>>,
     slash: SlashState,
+    /// Debounced ghost-text prediction fetch (W07); replaced on
+    /// every edit so a stale suffix never lands on newer text.
+    predict_task: Option<Task<()>>,
     /// Advertised invocations for the current device/harness/workspace.
     /// Invalidated on context changes; filtering stays local while typing.
     slash_cache: HashMap<String, Vec<InvocationCandidate>>,
@@ -6329,6 +6433,7 @@ impl Composer {
             mention: FileMentionState::default(),
             slash_task: None,
             slash: SlashState::default(),
+            predict_task: None,
             slash_cache: HashMap::new(),
             slash_scroll: gpui::ScrollHandle::new(),
             mention_scroll: gpui::ScrollHandle::new(),
@@ -7623,6 +7728,7 @@ impl Composer {
         }
         let (text, cursor) = (input.text().to_string(), input.cursor_offset());
         self.update_slash(&text, cursor, cx);
+        self.update_prediction(&text, cursor, cx);
         let token = mention_token(&text, cursor);
         let context = self
             .file_search_params("", cx)
@@ -7992,6 +8098,96 @@ impl Composer {
 
     /// Track the `/` token on every edit: open/refresh the popup, fetch the
     /// harness's command list on each open, filter locally per keystroke.
+    /// Ghost-text word prediction (W07): after a short debounce,
+    /// ask the selected OMP chat's live runtime to complete the
+    /// word at the cursor and show the suffix as ghost text.
+    /// Best-effort by design — no live run, a non-OMP chat, a popup
+    /// in the way, or a word shorter than two chars all just clear
+    /// the ghost; typing never blocks on it.
+    fn update_prediction(&mut self, text: &str, cursor: usize, cx: &mut Context<Self>) {
+        let input = self.input.clone();
+        let clear = |this: &mut Self, cx: &mut Context<Self>| {
+            this.predict_task = None;
+            input.update(cx, |input, cx| input.set_ghost(None, cx));
+        };
+        if self.slash.token.is_some() || self.mention.token.is_some() {
+            clear(self, cx);
+            return;
+        }
+        // The word fragment ending at the cursor (byte offsets).
+        let before = &text[..cursor.min(text.len())];
+        let fragment_len = before
+            .chars()
+            .rev()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .map(char::len_utf8)
+            .sum::<usize>();
+        if fragment_len < 2 {
+            clear(self, cx);
+            return;
+        }
+        let (engine, chat_id) = {
+            let state = self.state.read(cx);
+            let is_omp = state.selected_chat.as_ref().is_some_and(|selected| {
+                state
+                    .chats
+                    .iter()
+                    .find(|chat| &chat.id == selected)
+                    .and_then(|chat| chat.config.as_ref())
+                    .is_some_and(|config| config.harness == HarnessId::Omp)
+            });
+            match (state.engine().cloned(), state.selected_chat.clone()) {
+                (Some(engine), Some(chat_id)) if is_omp => (engine, chat_id),
+                _ => {
+                    drop(state);
+                    clear(self, cx);
+                    return;
+                }
+            }
+        };
+        let text = text.to_string();
+        let expected = text.clone();
+        self.predict_task = Some(cx.spawn(async move |this, cx| {
+            // GPUI tasks have no Tokio reactor: debounce on the
+            // background executor, never `tokio::time` (panics here).
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(250))
+                .await;
+            let reply = engine
+                .client()
+                .call(
+                    methods::OMP_PREDICT_WORD,
+                    serde_json::json!({
+                        "chatId": chat_id,
+                        "text": text,
+                        "cursor": cursor as i64,
+                    }),
+                )
+                .await;
+            let suffix = reply
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("suffix")
+                        .and_then(|suffix| suffix.as_str())
+                        .map(str::to_owned)
+                })
+                .filter(|suffix| !suffix.is_empty());
+            this.update(cx, |this, cx| {
+                // Stale guard: paint only if the draft still holds
+                // exactly the text the suggestion was made for.
+                let suffix = suffix.filter(|_| this.input.read(cx).text() == expected);
+                input.update(cx, |input, cx| {
+                    input.set_ghost(suffix.map(SharedString::from), cx)
+                });
+                this.predict_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
     fn update_slash(&mut self, text: &str, cursor: usize, cx: &mut Context<Self>) {
         let harness = self.pickers.read(cx).resolved(cx).harness;
         let preferences =
@@ -8083,6 +8279,26 @@ impl Composer {
                 let commands = async {
                     if skill || !commands_allowed {
                         return Ok(Vec::new());
+                    }
+                    // OMP answers with the faithful command list
+                    // (W07): aliases/subcommands/source survive,
+                    // unlike the lossy legacy projection. Any
+                    // failure falls back to the legacy list rather
+                    // than an empty popup.
+                    if harness == Some(HarnessId::Omp) {
+                        let faithful = engine
+                            .client()
+                            .call(methods::OMP_COMMANDS, params.clone())
+                            .await
+                            .and_then(|value| {
+                                serde_json::from_value::<
+                                    Vec<zeron_proto::omp::OmpSlashCommand>,
+                                >(value)
+                                .map_err(|e| RpcError::Failed(e.to_string()))
+                            });
+                        if let Ok(commands) = faithful {
+                            return Ok(omp_slash_candidates(&commands));
+                        }
                     }
                     let value = engine
                         .client()
@@ -9642,6 +9858,14 @@ impl Composer {
         self.interrupting.contains(chat_id)
     }
 
+    /// Replace the draft with extension-supplied text (OMP
+    /// `set_editor_text`, W04): the extension owns this text, so it
+    /// replaces rather than appends.
+    pub fn set_editor_text(&mut self, text: String, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| input.set_text(text, cx));
+        cx.notify();
+    }
+
     // ---- wizard glue ----
 
     fn wizard_select(&mut self, option_ix: usize, cx: &mut Context<Self>) {
@@ -9844,11 +10068,17 @@ impl Composer {
         let last = page + 1 >= wizard.questions.len();
         let typed_empty = self.input.read(cx).is_empty();
         let can_advance = wizard.page_has_pick() || !typed_empty || question.multiline;
+        let approval = wizard.is_approval_page();
 
         let options = question.options.iter().enumerate().map(|(ix, label)| {
             // Selection reads on the row only while no typed override exists
             // (typed answers win — zeron question-panel.tsx `isSel`).
             let picked = wizard.is_picked(ix) && typed_empty;
+            // Rich option metadata (W04): description/preview sub-lines
+            // and the recommended marker, when the runtime supplied them.
+            let (description, preview, recommended) = wizard.option_meta(ix);
+            let description = description.map(str::to_owned);
+            let preview = preview.map(str::to_owned);
             div()
                 .id(("wizard-option", ix))
                 .flex()
@@ -9881,14 +10111,51 @@ impl Composer {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .text_size(crate::typography::ui_rems(13.5))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(if picked {
-                            theme.text
-                        } else {
-                            theme.text.opacity(0.9)
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_baseline()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .text_size(crate::typography::ui_rems(13.5))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(if picked {
+                                            theme.text
+                                        } else {
+                                            theme.text.opacity(0.9)
+                                        })
+                                        .child(SharedString::from(label.clone())),
+                                )
+                                .when(recommended, |el| {
+                                    el.child(
+                                        div()
+                                            .text_size(crate::typography::ui_rems(11.0))
+                                            .text_color(theme.text_muted.opacity(0.7))
+                                            .child(SharedString::from("Recommended")),
+                                    )
+                                }),
+                        )
+                        .when(description.is_some(), |el| {
+                            el.child(
+                                div()
+                                    .text_size(crate::typography::ui_rems(12.0))
+                                    .text_color(theme.text_muted.opacity(0.85))
+                                    .child(SharedString::from(description.unwrap())),
+                            )
                         })
-                        .child(SharedString::from(label.clone())),
+                        .when(preview.is_some(), |el| {
+                            el.child(
+                                div()
+                                    .text_size(crate::typography::ui_rems(12.0))
+                                    .text_color(theme.text_muted.opacity(0.6))
+                                    .child(SharedString::from(preview.unwrap())),
+                            )
+                        }),
                 )
                 .when(ix < 9, |el| {
                     el.child(
@@ -9952,7 +10219,11 @@ impl Composer {
                                     .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(theme.text_muted.opacity(0.6))
                                     .child(SharedString::from(crate::popover::tracked_upper(
-                                        &question.header,
+                                        if approval {
+                                            "Approval required"
+                                        } else {
+                                            &question.header
+                                        },
                                     ))),
                             )
                             .when(wizard.questions.len() > 1, |el| {
@@ -9971,15 +10242,35 @@ impl Composer {
                                 )
                             }),
                     )
-                    .child(
+                    .child(if approval {
+                        // Dedicated approval card (W04): the operation
+                        // under approval — target and arguments, verbatim
+                        // from OMP — in a mono block, set apart from the
+                        // choices. The extension-UI wire carries no
+                        // structured target/policy fields, so the block
+                        // is the target text itself, never a paraphrase.
+                        div()
+                            .mt(px(8.0))
+                            .px(px(12.0))
+                            .py(px(10.0))
+                            .rounded(px(8.0))
+                            .bg(crate::theme::ink(0.04))
+                            .font_family(theme.font_mono.clone())
+                            .text_size(crate::typography::ui_rems(12.5))
+                            .line_height(px(18.0))
+                            .text_color(theme.text)
+                            .child(SharedString::from(question.question.clone()))
+                            .into_any_element()
+                    } else {
                         div()
                             .mt(px(6.0))
                             .text_size(crate::typography::ui_rems(15.0))
                             .line_height(px(20.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text)
-                            .child(SharedString::from(question.question.clone())),
-                    )
+                            .child(SharedString::from(question.question.clone()))
+                            .into_any_element()
+                    })
                     .when(question.multi_select, |el| {
                         el.child(
                             div()
@@ -10920,6 +11211,32 @@ impl Render for Composer {
                         .child(div().min_w_0().truncate().child(notice)),
                 ))
             });
+
+        // Extension surface strip (W04): OMP-set title/status/widget
+        // lines for this chat, one quiet muted line each above the box.
+        let omp_lines = self.state.read(cx).omp_surface_lines();
+        let container = if omp_lines.is_empty() {
+            container
+        } else {
+            container.child(
+                div()
+                    .id("composer-omp-surface")
+                    .mx(px(8.0))
+                    .mt(px(6.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .children(omp_lines.into_iter().map(|line| {
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(11.0))
+                            .line_height(px(14.0))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(line))
+                    })),
+            )
+        };
 
         if wizard_active {
             let wizard = self.render_wizard(cx);
@@ -14908,6 +15225,62 @@ mod tests {
     }
 
     #[test]
+    fn gpui_tasks_never_use_tokio_time() {
+        // Regression (crash A6732601): GPUI executor tasks have no Tokio
+        // reactor, so `tokio::time::*` panics in `Handle::current` and
+        // aborts the app. Debounces in UI tasks must use
+        // `cx.background_executor().timer(...)`.
+        let sleep = concat!("tokio", "::", "time", "::", "sleep");
+        let timeout = concat!("tokio", "::", "time", "::", "timeout");
+        for source in [include_str!("composer.rs"), include_str!("settings/models.rs")] {
+            assert!(
+                !source.contains(sleep),
+                "GPUI task code must not sleep on the Tokio reactor"
+            );
+            assert!(
+                !source.contains(timeout),
+                "GPUI task code must not time out on the Tokio reactor"
+            );
+        }
+    }
+
+    #[test]
+    fn omp_slash_candidates_keep_aliases_subcommands_and_source() {
+        let commands = vec![zeron_proto::omp::OmpSlashCommand {
+            name: "plan".into(),
+            description: "Plan a change".into(),
+            input_hint: Some("<goal>".into()),
+            aliases: vec!["p".into()],
+            subcommands: vec![zeron_proto::omp::OmpSlashSubcommand {
+                name: "show".into(),
+                description: None,
+                usage: Some("[id]".into()),
+            }],
+            source: "extension".into(),
+        }];
+        let rows = omp_slash_candidates(&commands);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "plan");
+        assert!(rows[0].description.contains("subcommands: show"));
+        assert!(rows[0].description.contains("extension"));
+        assert_eq!(rows[0].input_hint.as_deref(), Some("<goal>"));
+        assert_eq!(rows[1].name, "p");
+        assert!(rows[1].description.starts_with("Alias of /plan"));
+        // No fabricated rows for unknown future sources either.
+        let future = vec![zeron_proto::omp::OmpSlashCommand {
+            name: "future".into(),
+            description: String::new(),
+            input_hint: None,
+            aliases: Vec::new(),
+            subcommands: Vec::new(),
+            source: "future-source".into(),
+        }];
+        let rows = omp_slash_candidates(&future);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].description.contains("future-source"));
+    }
+
+    #[test]
     fn file_mentions_serialize_to_strict_local_markdown() {
         let raw = local_file_link("src/a file#[x].rs", false);
         assert_eq!(
@@ -15177,6 +15550,8 @@ mod tests {
 
     fn question(id: &str, options: &[&str], multi: bool) -> UserInputQuestion {
         UserInputQuestion {
+            option_details: Vec::new(),
+            recommended: None,
             id: id.into(),
             header: "Header".into(),
             question: format!("Question {id}"),
@@ -15936,6 +16311,46 @@ mod tests {
         assert_eq!(answers.len(), 2);
         assert_eq!(answers[0].labels, vec!["b"]);
         assert_eq!(answers[1].labels, vec!["x"]);
+    }
+
+    #[test]
+    fn approval_shape_is_detected_and_preferences_are_not_approvals() {
+        let approval = Wizard::new(
+            "req".into(),
+            vec![question(
+                "a1",
+                &["Approve", "Approve bash for this session", "Deny"],
+                false,
+            )],
+        );
+        assert!(approval.is_approval_page());
+        let preference = Wizard::new(
+            "req".into(),
+            vec![question("q", &["Yes", "Deny"], false)],
+        );
+        assert!(!preference.is_approval_page());
+        let plain = Wizard::new("req".into(), vec![question("q", &["a", "b"], false)]);
+        assert!(!plain.is_approval_page());
+    }
+
+    #[test]
+    fn wizard_recommended_option_starts_picked_and_carries_meta() {
+        let mut q = question("q", &["a", "b"], false);
+        q.recommended = Some(1);
+        q.option_details = vec![
+            zeron_proto::UserInputOptionDetail {
+                description: None,
+                preview: None,
+            },
+            zeron_proto::UserInputOptionDetail {
+                description: Some("the better one".into()),
+                preview: Some("preview".into()),
+            },
+        ];
+        let w = Wizard::new("req".into(), vec![q]);
+        assert!(w.is_picked(1));
+        assert_eq!(w.option_meta(1), (Some("the better one"), Some("preview"), true));
+        assert_eq!(w.option_meta(0), (None, None, false));
     }
 
     #[test]

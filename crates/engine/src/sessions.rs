@@ -59,6 +59,57 @@ pub enum SteerOutcome {
 
 type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
 
+/// Forward one input answer (or abandonment) between the engine's
+/// pending-resolver map and the harness's answer receiver.
+///
+/// The input bridge is invoked from whatever thread the driver uses —
+/// the OMP driver asks from a plain std thread, where `tokio::spawn`
+/// panics ("no reactor running") and the question then waits forever:
+/// that exact panic killed the answer path in the real app. So: spawn
+/// on Tokio when a reactor is present, otherwise poll on a std thread
+/// with identical semantics (answer forwards; dropped receiver removes
+/// the pending resolver and surfaces `InputResolved`).
+fn spawn_input_forwarder(
+    mut tx: oneshot::Sender<Vec<UserInputAnswer>>,
+    mut answer_rx: oneshot::Receiver<Vec<UserInputAnswer>>,
+    pending: PendingInputs,
+    engine_tx: mpsc::UnboundedSender<AgentEvent>,
+    request_id: String,
+) {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::spawn(async move {
+            tokio::select! {
+                // A dropped resolver stays an error for the harness, as before.
+                answer = answer_rx => if let Ok(answer) = answer { let _ = tx.send(answer); },
+                _ = tx.closed() => {
+                    lock(&pending).remove(&request_id);
+                    let _ = engine_tx.send(AgentEvent::InputResolved { request_id });
+                }
+            }
+        });
+    } else {
+        std::thread::spawn(move || loop {
+            match answer_rx.try_recv() {
+                Ok(answer) => {
+                    let _ = tx.send(answer);
+                    break;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => break,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    if tx.is_closed() {
+                        lock(&pending).remove(&request_id);
+                        let _ = engine_tx.send(AgentEvent::InputResolved {
+                            request_id: request_id.clone(),
+                        });
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
+        });
+    }
+}
+
 /// A harness-native session id plus the cwd it was created under. Harness
 /// session stores are cwd-scoped (claude keys conversations by project
 /// directory — zeron sessions.ts:563 "harness session stores are keyed by
@@ -218,6 +269,10 @@ struct Inner {
     runs: Mutex<HashMap<String, RunHandle>>,
     /// chat_id → broadcast hub (retained across runs so subscribers survive turns).
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
+    /// chat_id → transient OMP presentation hub (W04): fire-and-forget
+    /// extension presentation for viewports; not journaled, not in docs.
+    presentation_hubs:
+        Mutex<HashMap<String, broadcast::Sender<zeron_proto::omp::OmpPresentation>>>,
     statuses: Mutex<HashMap<String, Session>>,
     sessions_tx: watch::Sender<Vec<Session>>,
     /// Last dispatched request per chat — the steer→new-turn fallback re-derives its
@@ -241,6 +296,25 @@ struct Inner {
     /// Host-local OMP binding store (wired at engine assembly; absent in
     /// bare tests, where binding stamps no-op).
     omp_bindings: OnceLock<Arc<crate::omp_bindings::OmpBindingStore>>,
+    /// Non-chat OMP login flows (W05 onboarding): login_id → shared flow
+    /// state the background harness login writes and UI polls read.
+    omp_logins: Mutex<HashMap<String, Arc<Mutex<OmpLoginFlow>>>>,
+}
+
+/// One in-flight OMP login (W05). The harness thread's question
+/// bridge stores the pending questions + answer sender here; the
+/// UI poll reads them and `omp_login_answer` resolves the sender.
+/// Dropping the sender (cancel) answers the flow `Cancelled`
+/// fail-closed on the harness side.
+struct OmpLoginFlow {
+    provider_id: String,
+    status: zeron_proto::omp::OmpLoginStatus,
+    pending: Option<(
+        Vec<zeron_proto::UserInputQuestion>,
+        tokio::sync::oneshot::Sender<Vec<zeron_proto::UserInputAnswer>>,
+    )>,
+    open_url: Option<String>,
+    error: Option<String>,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -285,6 +359,7 @@ impl SessionsEngine {
                 doc_host: Mutex::new(None),
                 runs: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
+                presentation_hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
                 sessions_tx,
                 last_requests: Mutex::new(HashMap::new()),
@@ -294,6 +369,7 @@ impl SessionsEngine {
                 scratch_root: OnceLock::new(),
                 turn_listener: OnceLock::new(),
                 omp_bindings: OnceLock::new(),
+                omp_logins: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -348,6 +424,256 @@ impl SessionsEngine {
         harness
             .tool_detail(&binding.session_id, std::path::Path::new(&cwd), &request.tool_call_id)
             .await
+    }
+
+    /// Onboarding readiness of this host's OMP profile (W05).
+    pub async fn omp_readiness(&self) -> zeron_proto::omp::OmpReadiness {
+        zeron_harness::OmpHarness::new().readiness().await
+    }
+
+    /// Providers OMP can log in to on this host (W05, discovery only).
+    pub async fn omp_login_providers(
+        &self,
+    ) -> Result<Vec<zeron_proto::omp::OmpLoginProvider>, String> {
+        zeron_harness::OmpHarness::new()
+            .login_providers()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Stored credentials logout can remove for one provider (W05).
+    pub async fn omp_logout_accounts(
+        &self,
+        provider_id: &str,
+    ) -> Result<Vec<zeron_proto::omp::OmpLogoutAccount>, String> {
+        zeron_harness::OmpHarness::new()
+            .logout_accounts(provider_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Remove one stored credential through OMP (W05).
+    pub async fn omp_logout(
+        &self,
+        provider_id: &str,
+        credential_id: i64,
+    ) -> Result<zeron_proto::omp::OmpLogoutOutcome, String> {
+        zeron_harness::OmpHarness::new()
+            .logout(provider_id, credential_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Word-prediction suffix from the chat's live OMP runtime
+    /// (W07 ghost text). `None` when no run is live, the runtime
+    /// has no suggestion, or it does not answer promptly — typing
+    /// never waits on this.
+    pub async fn omp_predict_word(
+        &self,
+        chat_id: &str,
+        text: String,
+        cursor: i64,
+    ) -> Option<String> {
+        let turn = self.live_turn(chat_id)?;
+        let reply = turn.predict_word(text, cursor);
+        tokio::time::timeout(std::time::Duration::from_secs(3), reply)
+            .await
+            .ok()?
+            .ok()
+            .flatten()
+    }
+
+    /// Faithful OMP slash commands for `cwd` (W07 composer):
+    /// aliases, subcommands, source preserved.
+    pub async fn omp_commands(
+        &self,
+        cwd: &std::path::Path,
+    ) -> Result<Vec<zeron_proto::omp::OmpSlashCommand>, String> {
+        zeron_harness::OmpHarness::new()
+            .omp_commands(cwd)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Persistent model-role snapshot for `cwd` (W05).
+    pub async fn omp_model_roles(
+        &self,
+        cwd: &std::path::Path,
+    ) -> Result<zeron_proto::omp::OmpModelRoles, String> {
+        zeron_harness::OmpHarness::new()
+            .model_roles(cwd)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Assign a persistent role (W05); live sessions are unaffected.
+    pub async fn omp_set_model_role(
+        &self,
+        cwd: &std::path::Path,
+        role: &str,
+        selector: Option<&str>,
+    ) -> Result<zeron_proto::omp::OmpModelRoles, String> {
+        zeron_harness::OmpHarness::new()
+            .set_model_role(cwd, role, selector)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Replace the persistent cycle order (W05).
+    pub async fn omp_set_cycle_order(
+        &self,
+        cwd: &std::path::Path,
+        order: &[String],
+    ) -> Result<zeron_proto::omp::OmpModelRoles, String> {
+        zeron_harness::OmpHarness::new()
+            .set_cycle_order(cwd, order)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Replace one persistent fallback chain (W05).
+    pub async fn omp_set_fallback_chain(
+        &self,
+        cwd: &std::path::Path,
+        key: &str,
+        chain: &[String],
+    ) -> Result<zeron_proto::omp::OmpModelRoles, String> {
+        zeron_harness::OmpHarness::new()
+            .set_fallback_chain(cwd, key, chain)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Set the persistent default thinking level (W05).
+    pub async fn omp_set_default_thinking(
+        &self,
+        cwd: &std::path::Path,
+        level: &str,
+    ) -> Result<zeron_proto::omp::OmpModelRoles, String> {
+        zeron_harness::OmpHarness::new()
+            .set_default_thinking(cwd, level)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Provider usage limits as OMP accounts them (W05).
+    pub async fn omp_provider_limits(
+        &self,
+    ) -> Result<zeron_proto::omp::OmpProviderLimits, String> {
+        zeron_harness::OmpHarness::new()
+            .provider_limits()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Start a non-chat OMP login (W05 onboarding): the harness login
+    /// runs in the background; its browser URL and questions surface
+    /// through [`Self::omp_login_poll`]. Returns the login id.
+    pub fn omp_login_start(&self, provider_id: &str) -> String {
+        use zeron_proto::omp::OmpLoginStatus;
+        let login_id = uuid::Uuid::new_v4().to_string();
+        let flow = Arc::new(Mutex::new(OmpLoginFlow {
+            provider_id: provider_id.to_owned(),
+            status: OmpLoginStatus::Running,
+            pending: None,
+            open_url: None,
+            error: None,
+        }));
+        lock(&self.inner.omp_logins).insert(login_id.clone(), flow.clone());
+        let bridge_flow = flow.clone();
+        let input: zeron_harness::OmpInputBridge = Arc::new(move |questions| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let mut state = lock(&bridge_flow);
+            if matches!(state.status, OmpLoginStatus::Cancelled) {
+                drop(state);
+                drop(tx);
+            } else {
+                state.pending = Some((questions, tx));
+                state.status = OmpLoginStatus::AwaitingInput;
+            }
+            rx
+        });
+        let url_flow = flow.clone();
+        let open_url = Arc::new(move |url: String| {
+            lock(&url_flow).open_url = Some(url);
+        });
+        let provider_id = provider_id.to_owned();
+        tokio::spawn(async move {
+            let result = zeron_harness::OmpHarness::new()
+                .login(&provider_id, input, open_url)
+                .await;
+            let mut state = lock(&flow);
+            state.pending = None;
+            if state.status != OmpLoginStatus::Cancelled {
+                match result {
+                    Ok(_) => state.status = OmpLoginStatus::Done,
+                    Err(error) => {
+                        state.status = OmpLoginStatus::Failed;
+                        state.error = Some(error.to_string());
+                    }
+                }
+            }
+        });
+        login_id
+    }
+
+    /// Current state of one login flow (W05); `None` for unknown ids.
+    pub fn omp_login_poll(
+        &self,
+        login_id: &str,
+    ) -> Option<zeron_proto::omp::OmpLoginPoll> {
+        let flow = lock(&self.inner.omp_logins).get(login_id)?.clone();
+        let state = lock(&flow);
+        Some(zeron_proto::omp::OmpLoginPoll {
+            login_id: login_id.to_owned(),
+            provider_id: state.provider_id.clone(),
+            status: state.status,
+            questions: state
+                .pending
+                .as_ref()
+                .map(|(questions, _)| questions.clone())
+                .unwrap_or_default(),
+            open_url: state.open_url.clone(),
+            error: state.error.clone(),
+        })
+    }
+
+    /// Answer the pending questions of one login flow (W05). False
+    /// when nothing is pending (already answered, done, or unknown).
+    pub fn omp_login_answer(
+        &self,
+        login_id: &str,
+        answers: Vec<zeron_proto::UserInputAnswer>,
+    ) -> bool {
+        use zeron_proto::omp::OmpLoginStatus;
+        let Some(flow) = lock(&self.inner.omp_logins).get(login_id).cloned() else {
+            return false;
+        };
+        let mut state = lock(&flow);
+        let Some((_, tx)) = state.pending.take() else {
+            return false;
+        };
+        state.status = OmpLoginStatus::Running;
+        tx.send(answers).is_ok()
+    }
+
+    /// Cancel one login flow (W05): the pending answer sender drops,
+    /// which answers the harness side `Cancelled` fail-closed.
+    pub fn omp_login_cancel(&self, login_id: &str) -> bool {
+        use zeron_proto::omp::OmpLoginStatus;
+        let Some(flow) = lock(&self.inner.omp_logins).get(login_id).cloned() else {
+            return false;
+        };
+        let mut state = lock(&flow);
+        if matches!(
+            state.status,
+            OmpLoginStatus::Done | OmpLoginStatus::Failed | OmpLoginStatus::Cancelled
+        ) {
+            return false;
+        }
+        state.status = OmpLoginStatus::Cancelled;
+        state.pending = None;
+        true
     }
 
     /// The live run's turn control for a chat, when a run is up.
@@ -604,6 +930,20 @@ impl SessionsEngine {
             .map(|(seq, event)| JournaledEvent { seq, event })
             .collect();
         Ok((replay, rx))
+    }
+
+    /// Subscribe to a chat's transient OMP presentation stream (W04):
+    /// fire-and-forget extension presentation for viewports. No replay —
+    /// a late subscriber sees only what comes next, and these events
+    /// are never folded into the synced doc.
+    pub fn subscribe_presentations(
+        &self,
+        chat_id: &str,
+    ) -> broadcast::Receiver<zeron_proto::omp::OmpPresentation> {
+        let mut hubs = lock(&self.inner.presentation_hubs);
+        hubs.entry(chat_id.to_string())
+            .or_insert_with(|| broadcast::channel(64).0)
+            .subscribe()
     }
 
     /// Local experimental bootstrap. No Submit, empty user entry or title request.
@@ -900,25 +1240,20 @@ impl SessionsEngine {
             let engine_tx = engine_tx.clone();
             Box::new(move |questions: Vec<UserInputQuestion>| {
                 let (mut tx, rx) = oneshot::channel();
-                let (answer_tx, answer_rx) = oneshot::channel();
+                let (answer_tx, mut answer_rx) = oneshot::channel();
                 let request_id = new_id();
                 lock(&pending).insert(request_id.clone(), answer_tx);
                 let _ = engine_tx.send(AgentEvent::InputRequested {
                     request_id: request_id.clone(),
                     questions,
                 });
-                let pending = pending.clone();
-                let engine_tx = engine_tx.clone();
-                tokio::spawn(async move {
-                    tokio::select! {
-                        // A dropped resolver stays an error for the harness, as before.
-                        answer = answer_rx => if let Ok(answer) = answer { let _ = tx.send(answer); },
-                        _ = tx.closed() => {
-                            lock(&pending).remove(&request_id);
-                            let _ = engine_tx.send(AgentEvent::InputResolved { request_id });
-                        }
-                    }
-                });
+                spawn_input_forwarder(
+                    tx,
+                    answer_rx,
+                    pending.clone(),
+                    engine_tx.clone(),
+                    request_id,
+                );
                 rx
             })
         };
@@ -3117,6 +3452,24 @@ async fn drive_run(
             }
             continue;
         }
+        // Latest-message token/cost usage (W07 footer status): doc
+        // meta only, like context usage — never a transcript part.
+        if let AgentEvent::Usage {
+            input_tokens,
+            output_tokens,
+        } = &event
+        {
+            if let Err(err) = doc_ref.update_turn_usage(*input_tokens, *output_tokens, None) {
+                tracing::warn!(%chat_id, error = %err, "turn usage write failed");
+            }
+            continue;
+        }
+        if let AgentEvent::TurnCost { cost_usd } = &event {
+            if let Err(err) = doc_ref.update_turn_cost(*cost_usd) {
+                tracing::warn!(%chat_id, error = %err, "turn cost write failed");
+            }
+            continue;
+        }
         // PARKED: a steer boundary, a terminal Done, or SELF-CONTINUED OUTPUT
         // re-opens the session; everything else stays gated. The ACP child
         // keeps forwarding `session/update` frames after a turn completes,
@@ -3378,10 +3731,13 @@ async fn drive_run(
                 }
             }
             AgentEvent::OmpPresentation { presentation } => {
-                // Transient extension presentation: journaled + broadcast
-                // via publish below, never folded into the doc. Logged so
-                // notifications and (until the W04 UI lands) login URLs
-                // are not silently lost.
+                // Transient extension presentation: broadcast to
+                // viewports via the presentation hub below, never folded
+                // into the doc. Also logged so a presentation no
+                // viewport is watching is not silently lost.
+                if let Some(hub) = lock(&inner.presentation_hubs).get(&chat_id) {
+                    let _ = hub.send(presentation.clone());
+                }
                 use zeron_proto::omp::OmpPresentation as P;
                 match presentation {
                     P::Notify { message, kind } => {
@@ -3644,6 +4000,68 @@ async fn drive_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_forwarder_works_without_a_tokio_reactor() {
+        // Regression: this test thread has no Tokio reactor — the OMP
+        // driver's calling context, where `tokio::spawn` panicked and
+        // ask/approval answers never reached the agent (forever wait).
+        fn wait_answer(
+            rx: &mut oneshot::Receiver<Vec<UserInputAnswer>>,
+        ) -> Vec<UserInputAnswer> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match rx.try_recv() {
+                    Ok(answers) => return answers,
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                        assert!(std::time::Instant::now() < deadline, "answer never forwarded");
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        panic!("forwarder dropped the answer channel")
+                    }
+                }
+            }
+        }
+
+        let (tx, mut rx) = oneshot::channel::<Vec<UserInputAnswer>>();
+        let (answer_tx, answer_rx) = oneshot::channel::<Vec<UserInputAnswer>>();
+        let pending: PendingInputs = Arc::new(Mutex::new(HashMap::new()));
+        lock(&pending).insert("req-1".to_string(), answer_tx);
+        let (engine_tx, _engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
+        spawn_input_forwarder(tx, answer_rx, pending.clone(), engine_tx, "req-1".into());
+        // Answer exactly as `respond_input` does: remove + send.
+        let resolver = lock(&pending).remove("req-1").unwrap();
+        resolver
+            .send(vec![UserInputAnswer {
+                question_id: "q".into(),
+                labels: vec!["Approve".into()],
+            }])
+            .unwrap();
+        let answers = wait_answer(&mut rx);
+        assert_eq!(answers[0].labels, vec!["Approve".to_string()]);
+
+        // Abandonment: dropping the harness receiver resolves the
+        // pending entry instead of leaking it.
+        let (tx, rx) = oneshot::channel::<Vec<UserInputAnswer>>();
+        let (answer_tx, answer_rx) = oneshot::channel::<Vec<UserInputAnswer>>();
+        lock(&pending).insert("req-2".to_string(), answer_tx);
+        let (engine_tx, mut engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
+        spawn_input_forwarder(tx, answer_rx, pending.clone(), engine_tx, "req-2".into());
+        drop(rx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if lock(&pending).get("req-2").is_none() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "pending resolver leaked");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(matches!(
+            engine_rx.try_recv(),
+            Ok(AgentEvent::InputResolved { ref request_id }) if request_id == "req-2"
+        ));
+    }
 
     #[test]
     fn omp_detail_owner_gate_requires_binding_for_that_chat() {

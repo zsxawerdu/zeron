@@ -24,11 +24,12 @@
 mod harness;
 mod discovery;
 mod interactions;
+pub mod model_admin;
 mod normalize;
 pub mod settings;
 
 pub use discovery::{scan_sessions, sessions_root, OmpDiscoveredSession};
-pub use harness::OmpHarness;
+pub use harness::{OmpHarness, OmpInputBridge};
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -318,6 +319,55 @@ impl OmpRuntime {
             .map_err(map_rpc_error)
     }
 
+    /// Run a blocking wire command while draining the event stream on
+    /// the calling thread: each event goes to `on_event`, which may
+    /// queue inbound frames (extension UI responses) through the
+    /// sender; queued frames are forwarded between events. For
+    /// commands whose completion depends on those responses (login:
+    /// `open_url`/`input` arrive mid-call), where draining only after
+    /// the call would deadlock against the server's wait.
+    pub fn call_concurrent<C, F>(
+        &mut self,
+        command: &C,
+        mut on_event: F,
+    ) -> Result<C::Output, HarnessError>
+    where
+        C: WireCommand + Sync,
+        C::Output: Send,
+        F: FnMut(&Event, &std::sync::mpsc::Sender<RpcInbound>),
+    {
+        let Some(client) = self.client.take() else {
+            return Err(HarnessError::Protocol("omp runtime is closed".into()));
+        };
+        let Some(events) = self.events.take() else {
+            self.client = Some(client);
+            return Err(HarnessError::Protocol("OMP event stream missing".into()));
+        };
+        let (outbound_tx, outbound_rx) = std::sync::mpsc::channel::<RpcInbound>();
+        let result = std::thread::scope(|scope| {
+            let call_thread = scope.spawn(|| client.call(command).map_err(map_rpc_error));
+            while !call_thread.is_finished() {
+                while let Ok(frame) = outbound_rx.try_recv() {
+                    let _ = client.send(&frame).map_err(map_rpc_error);
+                }
+                match events.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok(event) => on_event(&event, &outbound_tx),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            while let Ok(frame) = outbound_rx.try_recv() {
+                let _ = client.send(&frame).map_err(map_rpc_error);
+            }
+            call_thread
+                .join()
+                .map_err(|_| HarnessError::Protocol("OMP call thread panicked".into()))?
+        });
+        self.client = Some(client);
+        self.events = Some(events);
+        result
+    }
+
     /// Queue an inbound frame that expects no correlated response
     /// (extension UI responses, host tool/URI results).
     pub fn send(&self, frame: &RpcInbound) -> Result<(), HarnessError> {
@@ -326,6 +376,15 @@ impl OmpRuntime {
             .ok_or_else(|| HarnessError::Protocol("omp runtime is closed".into()))?
             .send(frame)
             .map_err(map_rpc_error)
+    }
+
+    /// Ghost-text suffix for the prose word ending at `cursor`
+    /// (W07, `predict_word`); `None` when OMP has no suggestion.
+    pub fn predict_word(&self, text: &str, cursor: i64) -> Result<Option<String>, HarnessError> {
+        self.call(&wire::PredictWordCommand {
+            text: text.to_owned(),
+            cursor,
+        })
     }
 
     /// Session state snapshot (`get_state`).

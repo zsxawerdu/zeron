@@ -59,6 +59,75 @@ pub mod methods {
     /// available/expired/unavailable/forbidden outcome. Only the engine
     /// owning the chat's native OMP session may serve it.
     pub const OMP_TOOL_DETAIL: &str = "OmpToolDetail";
+    /// Stream of transient OMP extension presentation for one chat
+    /// (W04): notify/status/widget/title/editor-text/open-url frames
+    /// (`{presentation}`). Presentations are fire-and-forget and never
+    /// enter the synced doc; a viewport that subscribes late sees only
+    /// what comes next. Params: `{chatId}`.
+    pub const WATCH_OMP_PRESENTATION: &str = "WatchOmpPresentation";
+    /// OMP onboarding readiness for this host (W05): probed version,
+    /// qualified flag, provider/auth discovery, and the actionable
+    /// discovery error when no provider can be listed. No params;
+    /// reply: `zeron_proto::omp::OmpReadiness`. Local profile only —
+    /// OMP owns the credential store this describes.
+    pub const OMP_READINESS: &str = "OmpReadiness";
+    /// Providers OMP can log in to with auth state (W05).
+    /// No params; reply: `Vec<zeron_proto::omp::OmpLoginProvider>`.
+    pub const OMP_LOGIN_PROVIDERS: &str = "OmpLoginProviders";
+    /// Stored credentials logout can remove for one provider (W05).
+    /// Params: `{providerId}`; reply:
+    /// `Vec<zeron_proto::omp::OmpLogoutAccount>` (labels only).
+    pub const OMP_LOGOUT_ACCOUNTS: &str = "OmpLogoutAccounts";
+    /// Remove one stored credential through OMP (W05). Params:
+    /// `{providerId, credentialId}`; reply:
+    /// `zeron_proto::omp::OmpLogoutOutcome`. OMP rewrites its own
+    /// credential store; Zeron never touches the files.
+    pub const OMP_LOGOUT: &str = "OmpLogout";
+    /// Full-fidelity OMP model catalog for the hub (W05), with
+    /// last-known stale state. No params; reply:
+    /// `zeron_proto::omp::OmpCatalogSnapshot`.
+    pub const OMP_MODELS: &str = "OmpModels";
+    /// Persistent model-role snapshot (W05). Params: `{cwd?}`;
+    /// reply: `zeron_proto::omp::OmpModelRoles`.
+    pub const OMP_MODEL_ROLES: &str = "OmpModelRoles";
+    /// Assign/clear one persistent role (W05). Params:
+    /// `{cwd?, role, selector?}`; reply: fresh `OmpModelRoles`.
+    /// Persistent only — never changes a live session's model.
+    pub const OMP_SET_MODEL_ROLE: &str = "OmpSetModelRole";
+    /// Replace the persistent cycle order (W05). Params:
+    /// `{cwd?, roles}`; reply: fresh `OmpModelRoles`.
+    pub const OMP_SET_CYCLE_ORDER: &str = "OmpSetCycleOrder";
+    /// Replace one persistent fallback chain (W05). Params:
+    /// `{cwd?, key, chain}` (empty chain removes); reply: fresh
+    /// `OmpModelRoles`.
+    pub const OMP_SET_FALLBACK_CHAIN: &str = "OmpSetFallbackChain";
+    /// Set the persistent default thinking level (W05). Params:
+    /// `{cwd?, level}`; reply: fresh `OmpModelRoles`.
+    pub const OMP_SET_DEFAULT_THINKING: &str = "OmpSetDefaultThinking";
+    /// Provider usage limits (W05). No params; reply:
+    /// `zeron_proto::omp::OmpProviderLimits`.
+    pub const OMP_PROVIDER_LIMITS: &str = "OmpProviderLimits";
+    /// Start a non-chat OMP login (W05). Params: `{providerId}`;
+    /// reply: `{loginId}`. Questions/URL surface via polling.
+    pub const OMP_LOGIN_START: &str = "OmpLoginStart";
+    /// Poll one login flow (W05). Params: `{loginId}`; reply:
+    /// `zeron_proto::omp::OmpLoginPoll`.
+    pub const OMP_LOGIN_POLL: &str = "OmpLoginPoll";
+    /// Answer a login flow's pending questions (W05). Params:
+    /// `{loginId, answers}`; reply: `{accepted}`.
+    pub const OMP_LOGIN_ANSWER: &str = "OmpLoginAnswer";
+    /// Cancel a login flow (W05). Params: `{loginId}`; reply:
+    /// `{cancelled}`. Cancellation answers fail-closed.
+    pub const OMP_LOGIN_CANCEL: &str = "OmpLoginCancel";
+    /// Faithful OMP slash commands for the composer (W07): aliases,
+    /// subcommands and source preserved (`OmpSlashCommand`), unlike
+    /// the lossy legacy `ListCommands` projection. Params: `{cwd?}`;
+    /// reply: `Vec<zeron_proto::omp::OmpSlashCommand>`.
+    pub const OMP_COMMANDS: &str = "OmpCommands";
+    /// Word-prediction suffix from the chat's live OMP runtime
+    /// (W07 ghost text). Params: `{chatId, text, cursor}`; reply:
+    /// `{suffix: string|null}`. Best-effort: no live run answers null.
+    pub const OMP_PREDICT_WORD: &str = "OmpPredictWord";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
     pub const TAKE_PROJECT_ACTION_SETUP: &str = "TakeProjectActionSetup";
     /// Peer-to-peer delivery fallback: the SENDER's engine forwards a queued

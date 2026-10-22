@@ -89,6 +89,15 @@ pub enum QueueAction {
 
 /// Host ↔ runtime signals that span a persistent runtime's turns.
 ///
+/// One word-prediction request routed into a live runtime (W07):
+/// the runtime suggests a suffix for the word at `cursor`; a driver
+/// that never drains these answers nothing (receiver drops).
+pub struct PredictRequest {
+    pub text: String,
+    pub cursor: i64,
+    pub reply: oneshot::Sender<Option<String>>,
+}
+
 /// Stopping a turn is not tearing down the runtime: a runtime holds work the
 /// user never asked to stop (background subagents, background shells). A
 /// driver that returns true from [`Harness::stops_turn_in_place`] answers
@@ -101,16 +110,21 @@ pub struct TurnControl {
     background: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     queue_tx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Sender<QueueAction>>>,
     queue_rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<QueueAction>>>,
+    predict_tx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Sender<PredictRequest>>>,
+    predict_rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<PredictRequest>>>,
 }
 
 impl Default for TurnControl {
     fn default() -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
+        let (predict_tx, predict_rx) = std::sync::mpsc::channel();
         Self {
             stop: std::sync::Arc::new(tokio::sync::Notify::new()),
             background: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             queue_tx: std::sync::Arc::new(std::sync::Mutex::new(tx)),
             queue_rx: std::sync::Arc::new(std::sync::Mutex::new(rx)),
+            predict_tx: std::sync::Arc::new(std::sync::Mutex::new(predict_tx)),
+            predict_rx: std::sync::Arc::new(std::sync::Mutex::new(predict_rx)),
         }
     }
 }
@@ -146,6 +160,26 @@ impl TurnControl {
     /// unanswered (their receivers drop, which hosts read as failure).
     pub fn take_queue_action(&self) -> Option<QueueAction> {
         self.queue_rx.lock().ok()?.try_recv().ok()
+    }
+
+    /// Host: ask the live runtime for a word-completion suffix
+    /// (W07 ghost text). The receiver resolves `None` when no
+    /// driver answers (no live run, unsupported, no suggestion).
+    pub fn predict_word(
+        &self,
+        text: String,
+        cursor: i64,
+    ) -> oneshot::Receiver<Option<String>> {
+        let (reply, rx) = oneshot::channel();
+        if let Ok(tx) = self.predict_tx.lock() {
+            let _ = tx.send(PredictRequest { text, cursor, reply });
+        }
+        rx
+    }
+
+    /// Driver: take the next pending prediction request, if any.
+    pub fn take_predict_request(&self) -> Option<PredictRequest> {
+        self.predict_rx.lock().ok()?.try_recv().ok()
     }
 
     /// Driver: resolves once per [`Self::stop_turn`].
@@ -621,7 +655,9 @@ pub use codex::CodexHarness;
 pub use cursor::CursorHarness;
 pub use opencode::OpencodeHarness;
 pub use pi::PiHarness;
-pub use omp::{OmpApprovalMode, OmpExecutable, OmpHarness, OmpLaunch, OmpRuntime, OmpSession};
+pub use omp::{
+    OmpApprovalMode, OmpExecutable, OmpHarness, OmpInputBridge, OmpLaunch, OmpRuntime, OmpSession,
+};
 
 // ---------------------------------------------------------------------------
 // Child lifecycle (shared by the codex and ACP harnesses)
@@ -727,6 +763,29 @@ pub fn supports_titles(id: HarnessId) -> bool {
         id,
         HarnessId::Codex | HarnessId::ClaudeCode | HarnessId::Mock
     )
+}
+
+#[cfg(test)]
+mod turn_control_tests {
+    #[tokio::test]
+    async fn predict_word_round_trips_through_the_driver_side() {
+        let turn = super::TurnControl::default();
+        let mut reply = turn.predict_word("hello wor".into(), 9);
+        let request = turn.take_predict_request().expect("request queued");
+        assert_eq!(request.text, "hello wor");
+        assert_eq!(request.cursor, 9);
+        request.reply.send(Some("ld".into())).unwrap();
+        assert_eq!(reply.try_recv().unwrap().as_deref(), Some("ld"));
+        // Nothing queued: the driver side answers immediately empty.
+        assert!(turn.take_predict_request().is_none());
+        let mut unanswered = turn.predict_word("x".into(), 1);
+        drop(turn.take_predict_request().map(|request| request.reply));
+        // Dropping the request drops its sender: no suggestion.
+        assert!(matches!(
+            unanswered.try_recv(),
+            Err(_) | Ok(None)
+        ));
+    }
 }
 
 #[cfg(test)]

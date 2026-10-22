@@ -21,8 +21,22 @@ pub mod capabilities {
     /// The host accepts `SidebarSectionChange::Move` and orders sections by
     /// their placed key; older hosts reject the action outright.
     pub const SIDEBAR_SECTION_ORDER_V1: &str = "sidebar-section-order-v1";
+    /// The host streams transient OMP extension presentation
+    /// (`WatchOmpPresentation`, W04) for viewports.
+    pub const OMP_PRESENTATION_V1: &str = "omp-presentation-v1";
+    /// The host serves OMP account discovery/readiness and logout
+    /// (`OmpReadiness`/`OmpLoginProviders`/`OmpLogoutAccounts`/
+    /// `OmpLogout`, W05) against its local OMP profile.
+    pub const OMP_ACCOUNTS_V1: &str = "omp-accounts-v1";
+    /// The host serves the OMP model/role hub (`OmpModels`,
+    /// `OmpModelRoles` + role/cycle/fallback/thinking writes,
+    /// `OmpProviderLimits`, non-chat `OmpLogin*` flows, W05).
+    pub const OMP_MODELS_V1: &str = "omp-models-v1";
 
     pub const CURRENT: &[&str] = &[
+        OMP_PRESENTATION_V1,
+        OMP_ACCOUNTS_V1,
+        OMP_MODELS_V1,
         COMPOSER_REFERENCES_V1,
         MESSAGE_QUEUE_V1,
         MESSAGE_QUEUE_ACTIONS_V1,

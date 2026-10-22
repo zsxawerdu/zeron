@@ -365,6 +365,9 @@ pub struct ToolItem {
     /// The spawned SUBAGENT's doc id — the chip IS the index (there is no
     /// listing endpoint); with it the chip offers "Open subagent".
     pub subagent_ref: Option<SharedString>,
+    /// OMP native entry id for owner-side detail fetch (W07), when
+    /// the doc part carries one; the fetch also resolves by part id.
+    pub omp_entry_id: Option<SharedString>,
     /// Subagent lifecycle, distinct from `resolved` (eager-done: the spawn
     /// tool's own result lands while the subagent still runs).
     pub subagent_status: Option<SubagentStatus>,
@@ -745,6 +748,7 @@ fn thought_item(part_id: &str, tree: &BlockTree, live: bool) -> ToolItem {
         output_bytes: None,
         diff_ref: None,
         subagent_ref: None,
+        omp_entry_id: None,
         subagent_status: None,
         subagent_tail: None,
         kind: ToolItemKind::Thought,
@@ -1107,6 +1111,98 @@ pub enum RowKind {
         source_chat_id: SharedString,
         source_title: SharedString,
     },
+    /// A structured OMP session event rendered as a quiet notice
+    /// (W07): compaction, retry/fallback, model/thinking changes,
+    /// notices, media metadata. `label` is the human line; `detail`
+    /// carries the preserved native payload for generic inspection.
+    /// Tool-progress kinds never reach here — tool chips own those.
+    OmpNotice {
+        label: SharedString,
+        detail: Option<SharedString>,
+    },
+}
+
+/// Human line for one structured OMP event (W07). `None` hides
+/// kinds another surface already renders (tool progress streams —
+/// the tool chips; subagent lifecycle — spawn chips; queue updates
+/// — the queue UI). Known kinds pick their renderable fields;
+/// unknown kinds degrade to the kind token plus the preserved
+/// payload, never to silence (C4 generic inspection). Pure.
+pub fn omp_notice(kind: &str, native: &serde_json::Value) -> Option<(String, Option<String>)> {
+    let field = |keys: &[&str]| -> Option<String> {
+        keys.iter().find_map(|key| {
+            native
+                .get(key)
+                .and_then(|value| match value {
+                    serde_json::Value::String(text) if !text.is_empty() => Some(text.clone()),
+                    serde_json::Value::Bool(flag) => Some(flag.to_string()),
+                    serde_json::Value::Number(number) => Some(number.to_string()),
+                    _ => None,
+                })
+        })
+    };
+    let detail = || -> Option<String> {
+        let text = serde_json::to_string(native).ok()?;
+        (text.len() > 2 && text != "{}").then(|| {
+            if text.len() > 240 {
+                format!("{}…", &text[..240])
+            } else {
+                text
+            }
+        })
+    };
+    let label = match kind {
+        "tool_execution_update" | "tool_stream_update" | "subagent_lifecycle" | "queue_update" => {
+            return None;
+        }
+        "auto_compaction_start" => "Compacting context…".to_string(),
+        "auto_compaction_end" => "Context compacted".to_string(),
+        "auto_retry_start" => "Retrying…".to_string(),
+        "auto_retry_end" => "Retry finished".to_string(),
+        "cache_warming_start" => "Warming cache…".to_string(),
+        "cache_warming_end" => "Cache warmed".to_string(),
+        "retry_fallback_applied" => format!(
+            "Switched to fallback model{}",
+            field(&["model", "modelId", "to"]).map(|m| format!(": {m}")).unwrap_or_default()
+        ),
+        "retry_fallback_succeeded" => "Fallback model succeeded".to_string(),
+        "notice" => field(&["message", "text", "title"]).unwrap_or_else(|| "Notice".to_string()),
+        "model_changed" => format!(
+            "Model changed{}",
+            field(&["model", "modelId", "to", "name"])
+                .map(|m| format!(": {m}"))
+                .unwrap_or_default()
+        ),
+        "thinking_level_changed" => format!(
+            "Thinking level{}",
+            field(&["level", "thinkingLevel", "to"])
+                .map(|m| format!(": {m}"))
+                .unwrap_or_default()
+        ),
+        "goal_updated" => "Goal updated".to_string(),
+        "todo_reminder" => "Todo reminder".to_string(),
+        "todo_auto_clear" => "Todos cleared".to_string(),
+        "irc_message" => format!(
+            "Worker message{}",
+            field(&["from", "sender"]).map(|m| format!(" from {m}")).unwrap_or_default()
+        ),
+        "advisor_cost_changed" => "Advisor cost changed".to_string(),
+        "advisor_yielded" => "Advisor yielded".to_string(),
+        "ttsr_triggered" => "Tool steering triggered".to_string(),
+        "config_warnings_changed" => "Configuration warning".to_string(),
+        "image_content" => format!(
+            "Image{}",
+            field(&["mimeType"]).map(|m| format!(" ({m})")).unwrap_or_default()
+        ),
+        "redacted_thinking" => "Redacted thinking".to_string(),
+        "fallback" => "Fallback content".to_string(),
+        "anthropic_server_tool" => format!(
+            "Server tool{}",
+            field(&["name", "type"]).map(|m| format!(": {m}")).unwrap_or_default()
+        ),
+        other => other.replace('_', " "),
+    };
+    Some((label, detail()))
 }
 
 fn generated_image_devices(owner: &str, fallback: &[String]) -> Vec<String> {
@@ -1487,6 +1583,7 @@ pub fn rows_for_entry(
                 subagent_ref,
                 subagent_status,
                 subagent_tail,
+                omp_entry_id,
                 ..
             } => {
                 let item = ToolItem {
@@ -1501,6 +1598,7 @@ pub fn rows_for_entry(
                     output_bytes: *output_bytes,
                     diff_ref: diff_ref.clone().map(SharedString::from),
                     subagent_ref: subagent_ref.clone().map(SharedString::from),
+                    omp_entry_id: omp_entry_id.clone().map(SharedString::from),
                     subagent_status: *subagent_status,
                     subagent_tail: subagent_tail.clone().map(SharedString::from),
                     kind: ToolItemKind::Call,
@@ -1738,11 +1836,29 @@ pub fn rows_for_entry(
                         });
                     }
                     // Tools and thoughts are grouped by the outer arms;
-                    // nothing reaches here. Structured OMP events are
-                    // preserved in the doc but not yet rendered (W07).
-                    MessagePart::Tool { .. }
-                    | MessagePart::Reasoning { .. }
-                    | MessagePart::OmpStructured { .. } => {}
+                    // nothing reaches here.
+                    MessagePart::Tool { .. } | MessagePart::Reasoning { .. } => {}
+                    MessagePart::OmpStructured {
+                        id: part_id,
+                        kind,
+                        native,
+                    } => {
+                        if let Some((label, detail)) = omp_notice(kind, native) {
+                            rows.push(Row {
+                                id: format!("{}#{}", entry.id, part_id).into(),
+                                version: fnv1a(label.as_bytes()),
+                                turn_start: false,
+                                kind: RowKind::OmpNotice {
+                                    label: label.into(),
+                                    detail: detail.map(Into::into),
+                                },
+                                entry_id: entry_id.clone(),
+                                timestamp: None,
+                                copy_text: None,
+                                compact_fold: None,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -2254,6 +2370,11 @@ pub const BLOB_AFFORDANCE_HEIGHT: f32 = 24.0;
 struct ChipAffordance {
     blob_ref: SharedString,
     label: SharedString,
+    /// OMP owner-side detail fetch (W07): `(part_id, entry_id)` of
+    /// the tool call when this affordance fetches via `OmpToolDetail`
+    /// instead of a sidecar blob. `blob_ref` then holds
+    /// `omp:<part_id>` as the fetch-state key.
+    omp_tool: Option<(SharedString, Option<SharedString>)>,
 }
 
 /// Line cap for a FETCHED full output (a defensive ceiling, not a doc cap —
@@ -3403,6 +3524,10 @@ pub struct Transcript {
     /// Deliberately NOT cleared on chat switch: refs are chat-qualified and a
     /// fetched blob stays valid.
     blob_details: HashMap<SharedString, BlobFetch>,
+    /// OMP owner-side tool detail fetches, keyed by `omp:<part_id>`
+    /// (W07). Like `blob_details`, kept across chat switches: keys
+    /// are part ids within their owning chat's native history.
+    omp_details: HashMap<SharedString, OmpDetailFetch>,
     /// Monotonic fetch order per blob ref: when a tool has BOTH a diff and
     /// an output blob fetched, the chip shows the one requested most
     /// recently (click "Show full output" after a diff → see the output).
@@ -3417,6 +3542,22 @@ enum BlobFetch {
     Loading(#[allow(dead_code)] Task<()>),
     /// Failed with the affordance re-armed as a retry.
     Failed,
+    Ready(Arc<ToolDetail>),
+}
+
+/// Fetch-state key for one tool's OMP owner-side detail (W07).
+fn omp_detail_key(part_id: &str) -> SharedString {
+    format!("omp:{part_id}").into()
+}
+
+/// One OMP detail fetch's lifecycle (W07). Terminal non-available
+/// outcomes land as `Ready` holding an explicit message detail —
+/// expired/forbidden/unavailable are rendered, never hidden.
+enum OmpDetailFetch {
+    Loading(#[allow(dead_code)] Task<()>),
+    /// Transport-level failure; the affordance re-arms as a retry
+    /// with this message as its label.
+    Failed(SharedString),
     Ready(Arc<ToolDetail>),
 }
 
@@ -3694,6 +3835,7 @@ impl Transcript {
             visuals: HashMap::new(),
             attachment_retries: HashMap::new(),
             blob_details: HashMap::new(),
+            omp_details: HashMap::new(),
             blob_fetch_order: HashMap::new(),
             blob_fetch_counter: 0,
             _observe: observe,
@@ -5368,6 +5510,100 @@ impl Transcript {
             .ok();
         });
         self.blob_details.insert(blob_ref, BlobFetch::Loading(task));
+    }
+
+    /// Fetch one OMP tool's full detail from the owning host's
+    /// native history (W07): the doc carries only the bounded
+    /// summary, so expanding asks `OmpToolDetail` lazily. Every
+    /// outcome is explicit — available (native payload, pretty
+    /// printed), expired, forbidden (not the owner device), or
+    /// unavailable with its reason — and detail is never
+    /// reconstructed from the summary.
+    fn spawn_omp_detail_fetch(
+        &mut self,
+        part_id: String,
+        entry_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let key = omp_detail_key(&part_id);
+        match self.omp_details.get(&key) {
+            Some(OmpDetailFetch::Ready(_)) => {
+                cx.notify();
+                return;
+            }
+            Some(OmpDetailFetch::Loading(_)) => return,
+            Some(OmpDetailFetch::Failed(_)) | None => {}
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let Some(chat_id) = self.chat_id.clone() else {
+            return;
+        };
+        let task_key = key.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let reply = crate::attachments::call_with_timeout(
+                &engine,
+                cx.background_executor(),
+                zeron_rpc::methods::OMP_TOOL_DETAIL,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "toolCallId": part_id,
+                    "entryId": entry_id,
+                }),
+                Duration::from_secs(20),
+            )
+            .await;
+            let fetched = match reply {
+                Ok(value) => {
+                    match serde_json::from_value::<zeron_proto::omp::OmpToolDetail>(value) {
+                        Ok(zeron_proto::omp::OmpToolDetail::Available { native, .. }) => {
+                            let text = serde_json::to_string_pretty(&native)
+                                .unwrap_or_else(|_| native.to_string());
+                            blob_detail(&text, false)
+                                .map(|d| OmpDetailFetch::Ready(Arc::new(d)))
+                                .unwrap_or_else(|| {
+                                    OmpDetailFetch::Failed("Empty detail".into())
+                                })
+                        }
+                        Ok(zeron_proto::omp::OmpToolDetail::Expired) => OmpDetailFetch::Ready(
+                            Arc::new(ToolDetail::Output {
+                                lines: vec![
+                                    "Full detail is no longer available: the native record has expired."
+                                        .into(),
+                                ],
+                                truncated_by: 0,
+                            }),
+                        ),
+                        Ok(zeron_proto::omp::OmpToolDetail::Forbidden) => OmpDetailFetch::Ready(
+                            Arc::new(ToolDetail::Output {
+                                lines: vec![
+                                    "Full detail is only available on the device that owns this session."
+                                        .into(),
+                                ],
+                                truncated_by: 0,
+                            }),
+                        ),
+                        Ok(zeron_proto::omp::OmpToolDetail::Unavailable { reason }) => {
+                            OmpDetailFetch::Ready(Arc::new(ToolDetail::Output {
+                                lines: vec![SharedString::from(format!(
+                                    "Full detail unavailable: {reason}"
+                                ))],
+                                truncated_by: 0,
+                            }))
+                        }
+                        Err(error) => OmpDetailFetch::Failed(error.to_string().into()),
+                    }
+                }
+                Err(error) => OmpDetailFetch::Failed(error.to_string().into()),
+            };
+            this.update(cx, |this, cx| {
+                this.omp_details.insert(task_key, fetched);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.omp_details.insert(key, OmpDetailFetch::Loading(task));
     }
 
     /// Expand/collapse one long user bubble. Heights come from the text's
@@ -7561,6 +7797,9 @@ impl Transcript {
             }
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
             RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
+            RowKind::OmpNotice { label, detail } => {
+                omp_notice_row(label.clone(), detail.clone(), &theme)
+            }
         };
         // Diagram fences this row just requested start rendering after layout.
         self.ensure_diagram_worker(cx);
@@ -8013,6 +8252,17 @@ impl Transcript {
                 .release_row(row_id, Self::tool_images_of, cx);
             &[]
         };
+        // OMP chats fetch full tool detail from the owner's native
+        // history instead of sidecar blobs (W07).
+        let is_omp_chat = self.chat_id.as_ref().is_some_and(|chat_id| {
+            self.state
+                .read(cx)
+                .chats
+                .iter()
+                .find(|chat| &chat.id == chat_id)
+                .and_then(|chat| chat.config.as_ref())
+                .is_some_and(|config| config.harness == zeron_proto::HarnessId::Omp)
+        });
         // Chips render their EFFECTIVE detail: the precomputed doc-resident
         // one, upgraded in place by a fetched sidecar blob (chat2-sync A3).
         // Resolved per paint (a HashMap probe per chip) so fetched content
@@ -8037,6 +8287,13 @@ impl Transcript {
                             best = Some((order, detail.clone()));
                         }
                     }
+                }
+                // A fetched OMP owner-side detail upgrades the
+                // bounded summary exactly like a fetched blob (W07).
+                if let Some(OmpDetailFetch::Ready(detail)) =
+                    self.omp_details.get(&omp_detail_key(&tool.part_id))
+                {
+                    return Some(detail.clone());
                 }
                 best.map(|(_, d)| d).or_else(|| tool.detail.clone())
             })
@@ -8095,6 +8352,36 @@ impl Transcript {
                     return Some(ChipAffordance {
                         blob_ref: blob_ref.clone(),
                         label: SharedString::from(label),
+                        omp_tool: None,
+                    });
+                }
+                // OMP owner-side detail (W07): no sidecar blob exists
+                // for these — the full call/result lives in native
+                // history on the owning host and is fetched lazily.
+                // Explicit outcomes (loading/failed/expired/…) are
+                // the label; the fetch never invents detail.
+                if is_omp_chat
+                    && tool.resolved
+                    && tool.output_ref.is_none()
+                    && tool.diff_ref.is_none()
+                    && !is_spawn_link(tool)
+                {
+                    let key: SharedString = omp_detail_key(&tool.part_id);
+                    let label = match self.omp_details.get(&key) {
+                        Some(OmpDetailFetch::Ready(_)) => return None,
+                        Some(OmpDetailFetch::Loading(_)) => "Loading full detail…".to_string(),
+                        Some(OmpDetailFetch::Failed(message)) => {
+                            format!("{message} — tap to retry")
+                        }
+                        None => "Show full detail".to_string(),
+                    };
+                    return Some(ChipAffordance {
+                        blob_ref: key,
+                        label: SharedString::from(label),
+                        omp_tool: Some((
+                            tool.part_id.clone().into(),
+                            tool.omp_entry_id.clone(),
+                        )),
                     });
                 }
                 None
@@ -8520,11 +8807,23 @@ impl Transcript {
                                 theme,
                             ));
                     }
-                    if let Some(ChipAffordance { blob_ref, label }) = affordance {
-                        let loading = matches!(
-                            self.blob_details.get(&blob_ref),
-                            Some(BlobFetch::Loading(_))
-                        );
+                    if let Some(ChipAffordance {
+                        blob_ref,
+                        label,
+                        omp_tool,
+                    }) = affordance
+                    {
+                        let loading = if omp_tool.is_some() {
+                            matches!(
+                                self.omp_details.get(&blob_ref),
+                                Some(OmpDetailFetch::Loading(_))
+                            )
+                        } else {
+                            matches!(
+                                self.blob_details.get(&blob_ref),
+                                Some(BlobFetch::Loading(_))
+                            )
+                        };
                         let mut row = div()
                             .id(SharedString::from(format!("{key}-blob")))
                             .h(px(BLOB_AFFORDANCE_HEIGHT))
@@ -8539,7 +8838,15 @@ impl Transcript {
                                 .cursor_pointer()
                                 .hover(|s| s.text_color(theme.text_muted))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.spawn_blob_fetch(blob_ref.clone(), cx);
+                                    if let Some((part_id, entry_id)) = &omp_tool {
+                                        this.spawn_omp_detail_fetch(
+                                            part_id.to_string(),
+                                            entry_id.as_ref().map(|e| e.to_string()),
+                                            cx,
+                                        );
+                                    } else {
+                                        this.spawn_blob_fetch(blob_ref.clone(), cx);
+                                    }
                                     cx.notify();
                                 }));
                         }
@@ -9044,6 +9351,73 @@ fn user_file_pill(name: &str, theme: &Theme) -> AnyElement {
 /// WRAPS instead of truncating: startup-crash errors carry the agent's exit
 /// status and stderr, and a one-line ellipsis was exactly what made
 /// zeronsh/comet#95 undiagnosable from the screenshot.
+/// A quiet structured-event notice (W07): one muted line, with the
+/// preserved native payload under it in small mono for generic
+/// inspection. No card, no icon — these are session bookkeeping,
+/// not agent output.
+#[cfg(test)]
+mod omp_notice_tests {
+    use super::omp_notice;
+    use serde_json::json;
+
+    #[test]
+    fn tool_progress_and_queue_kinds_are_hidden() {
+        for kind in [
+            "tool_execution_update",
+            "tool_stream_update",
+            "subagent_lifecycle",
+            "queue_update",
+        ] {
+            assert_eq!(omp_notice(kind, &json!({})), None, "{kind}");
+        }
+    }
+
+    #[test]
+    fn known_kinds_pick_renderable_fields() {
+        let (label, _) = omp_notice("model_changed", &json!({"modelId": "gpt-5.2"})).unwrap();
+        assert_eq!(label, "Model changed: gpt-5.2");
+        let (label, _) = omp_notice("notice", &json!({"message": "heads up"})).unwrap();
+        assert_eq!(label, "heads up");
+        let (label, detail) = omp_notice("auto_compaction_end", &json!({"tokens": 42})).unwrap();
+        assert_eq!(label, "Context compacted");
+        assert!(detail.is_some_and(|d| d.contains("42")));
+    }
+
+    #[test]
+    fn unknown_kinds_degrade_to_inspection_not_silence() {
+        let (label, detail) = omp_notice("future_event", &json!({"x": 1})).unwrap();
+        assert_eq!(label, "future event");
+        assert!(detail.is_some());
+        // Empty payloads carry no detail line.
+        let (_, detail) = omp_notice("future_event", &json!({})).unwrap();
+        assert_eq!(detail, None);
+    }
+}
+
+fn omp_notice_row(label: SharedString, detail: Option<SharedString>, theme: &Theme) -> AnyElement {
+    let mut column = div()
+        .py(px(3.0))
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .child(
+            div()
+                .text_size(crate::typography::ui_rems(12.0))
+                .text_color(theme.text_muted)
+                .child(label),
+        );
+    if let Some(detail) = detail {
+        column = column.child(
+            div()
+                .text_size(crate::typography::ui_rems(11.0))
+                .text_color(theme.text_faint)
+                .child(detail),
+        );
+    }
+    column.into_any_element()
+}
+
 fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
     div()
         .py(px(4.0))
@@ -10587,6 +10961,7 @@ mod tests {
                                 frame,
                                 replay_baseline,
                                 context_usage: None,
+                                turn_usage: None,
                             },
                             cx,
                         )
@@ -10699,6 +11074,7 @@ mod tests {
             .prepare(&zeron_doc::TranscriptUpdate {
                 frame: zeron_doc::TranscriptFrame::reset(&original),
                 context_usage: None,
+                turn_usage: None,
                 replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&original)),
             })
             .unwrap();
@@ -10711,6 +11087,7 @@ mod tests {
             .prepare(&zeron_doc::TranscriptUpdate {
                 frame: zeron_doc::diff_transcript(&original, &changed),
                 context_usage: None,
+                turn_usage: None,
                 replay_baseline: None,
             })
             .unwrap();
@@ -10735,6 +11112,7 @@ mod tests {
                 replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&entries)),
                 frame: zeron_doc::TranscriptFrame::Reset { reset: entries },
                 context_usage: None,
+                turn_usage: None,
             };
             let start = Instant::now();
             let prepared = TranscriptPreparation::default().prepare(&update).unwrap();
@@ -10821,6 +11199,7 @@ mod tests {
                                     entries,
                                 )),
                                 context_usage: None,
+                                turn_usage: None,
                             },
                             pending,
                             cx,
@@ -10875,6 +11254,7 @@ mod tests {
                             frame: zeron_doc::diff_transcript(&full, &live),
                             replay_baseline: None,
                             context_usage: None,
+                            turn_usage: None,
                         },
                         cx,
                     )
@@ -10914,6 +11294,7 @@ mod tests {
                         zeron_doc::TranscriptUpdate {
                             frame,
                             context_usage: None,
+                            turn_usage: None,
                             replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&history)),
                         },
                         cx,
@@ -10925,6 +11306,7 @@ mod tests {
                         zeron_doc::TranscriptUpdate {
                             frame: zeron_doc::diff_transcript(&history, &live),
                             context_usage: None,
+                            turn_usage: None,
                             replay_baseline: None,
                         },
                         cx,
@@ -10961,6 +11343,7 @@ mod tests {
                                 frame,
                                 replay_baseline: baseline,
                                 context_usage: None,
+                                turn_usage: None,
                             },
                             cx,
                         )
@@ -11017,6 +11400,7 @@ mod tests {
                         zeron_doc::TranscriptUpdate {
                             frame: zeron_doc::TranscriptFrame::reset(&[]),
                             context_usage: None,
+                            turn_usage: None,
                             replay_baseline: Some(Default::default()),
                         },
                         cx,
@@ -11035,6 +11419,7 @@ mod tests {
                         zeron_doc::TranscriptUpdate {
                             frame: zeron_doc::diff_transcript(&[], &live),
                             context_usage: None,
+                            turn_usage: None,
                             replay_baseline: None,
                         },
                         cx,
@@ -11069,6 +11454,7 @@ mod tests {
                         zeron_doc::TranscriptUpdate {
                             frame,
                             context_usage: None,
+                            turn_usage: None,
                             replay_baseline: None,
                         },
                         cx,
@@ -13249,6 +13635,7 @@ mod tests {
                                 zeron_doc::TranscriptUpdate {
                                     frame: zeron_doc::TranscriptFrame::reset(&history),
                                     context_usage: None,
+                                    turn_usage: None,
                                     replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(
                                         &history,
                                     )),
@@ -13277,6 +13664,7 @@ mod tests {
                                 zeron_doc::TranscriptUpdate {
                                     frame: zeron_doc::diff_transcript(&history, &next),
                                     context_usage: None,
+                                    turn_usage: None,
                                     // The RPC must retain its opening cutoff when
                                     // publishing subsequent changed-part history.
                                     replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(
@@ -13332,6 +13720,7 @@ mod tests {
                                 zeron_doc::TranscriptUpdate {
                                     frame: zeron_doc::TranscriptFrame::reset(&history),
                                     context_usage: None,
+                                    turn_usage: None,
                                     replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(
                                         &history,
                                     )),
@@ -13344,6 +13733,7 @@ mod tests {
                                 zeron_doc::TranscriptUpdate {
                                     frame: zeron_doc::diff_transcript(&history, &live),
                                     context_usage: None,
+                                    turn_usage: None,
                                     replay_baseline: None,
                                 },
                                 cx,
@@ -13394,6 +13784,7 @@ mod tests {
                                 zeron_doc::TranscriptUpdate {
                                     frame: zeron_doc::diff_transcript(&live, &next),
                                     context_usage: None,
+                                    turn_usage: None,
                                     replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(
                                         &next_history,
                                     )),
@@ -13501,6 +13892,7 @@ mod tests {
                                     zeron_doc::TranscriptUpdate {
                                         frame,
                                         context_usage: None,
+                                        turn_usage: None,
                                         replay_baseline: Some(
                                             zeron_doc::TranscriptBaseline::capture(&updated),
                                         ),
@@ -15530,6 +15922,7 @@ mod tests {
             output_bytes: None,
             diff_ref: None,
             subagent_ref: None,
+        omp_entry_id: None,
             subagent_status: None,
             subagent_tail: None,
             kind: ToolItemKind::Call,
@@ -15550,6 +15943,7 @@ mod tests {
             output_bytes: None,
             diff_ref: None,
             subagent_ref: None,
+        omp_entry_id: None,
             subagent_status: None,
             subagent_tail: None,
             kind: ToolItemKind::Call,
@@ -15586,6 +15980,7 @@ mod tests {
                 output_bytes: None,
                 diff_ref: None,
                 subagent_ref: None,
+        omp_entry_id: None,
                 subagent_status: None,
                 subagent_tail: None,
                 kind: ToolItemKind::Call,
@@ -15604,6 +15999,7 @@ mod tests {
                 output_bytes: None,
                 diff_ref: None,
                 subagent_ref: None,
+        omp_entry_id: None,
                 subagent_status: None,
                 subagent_tail: None,
                 kind: ToolItemKind::Call,
@@ -15620,6 +16016,7 @@ mod tests {
                 output_bytes: None,
                 diff_ref: None,
                 subagent_ref: None,
+        omp_entry_id: None,
                 subagent_status: None,
                 subagent_tail: None,
                 kind: ToolItemKind::Call,
@@ -15776,6 +16173,7 @@ mod tests {
             output_bytes: None,
             diff_ref: None,
             subagent_ref: None,
+        omp_entry_id: None,
             subagent_status: None,
             subagent_tail: None,
             kind: ToolItemKind::Call,

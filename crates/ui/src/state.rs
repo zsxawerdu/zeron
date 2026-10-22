@@ -50,6 +50,7 @@ struct CachedTranscript {
     chat_id: String,
     entries: Vec<SessionMessageEntry>,
     context_usage: Option<zeron_proto::ContextUsage>,
+    turn_usage: Option<zeron_proto::TurnUsage>,
     bytes: usize,
 }
 
@@ -817,6 +818,7 @@ pub struct AppState {
     /// chat's doc holds them (every device sees the same queue).
     pub queue: Vec<zeron_doc::QueuedMessage>,
     pub context_usage: Option<zeron_proto::ContextUsage>,
+    pub turn_usage: Option<zeron_proto::TurnUsage>,
     /// The selected chat has a transcript from a `WatchDocMessages` reset
     /// (including a retained reset from an earlier visit). An
     /// empty transcript is otherwise indistinguishable from the pre-replay
@@ -866,6 +868,17 @@ pub struct AppState {
     change_requests: ChangeRequestClientState,
     change_request_tasks: HashMap<ChangeRequestWatchKey, Task<()>>,
     queue_task: Option<Task<()>>,
+    presentation_task: Option<Task<()>>,
+    /// Transient OMP presentation effects awaiting the shell (W04):
+    /// notify/open-url/editor-text, drained once by `on_state_changed`.
+    omp_pending: Vec<zeron_proto::omp::OmpPresentation>,
+    /// Extension-set status lines for the selected chat (W04), in
+    /// arrival order; a `None` text clears its key.
+    omp_status: Vec<(String, String)>,
+    /// Extension-set widget lines for the selected chat (W04).
+    omp_widgets: Vec<(String, Vec<String>)>,
+    /// Extension-set title for the selected chat (W04).
+    omp_title: Option<String>,
     change_requests_visible: bool,
     /// SUBAGENT transcripts keyed by subagent doc id (the right pane's
     /// subagent tabs read these). Independent of `selected_chat`: a tab's
@@ -949,6 +962,7 @@ impl AppState {
             transcript: Vec::new(),
             queue: Vec::new(),
             context_usage: None,
+            turn_usage: None,
             transcript_replayed: false,
             transcript_baselines: HashMap::new(),
             transcript_cache: Default::default(),
@@ -971,6 +985,11 @@ impl AppState {
             change_requests: ChangeRequestClientState::default(),
             change_request_tasks: HashMap::new(),
             queue_task: None,
+            presentation_task: None,
+            omp_pending: Vec::new(),
+            omp_status: Vec::new(),
+            omp_widgets: Vec::new(),
+            omp_title: None,
             change_requests_visible: true,
             sub_transcripts: HashMap::new(),
             sub_watch_tasks: HashMap::new(),
@@ -1185,11 +1204,17 @@ impl AppState {
             self.restore_canvas_target();
             self.transcript.clear();
             self.context_usage = None;
+            self.turn_usage = None;
             self.transcript_revision = self.transcript_revision.wrapping_add(1);
             self.transcript_replayed = false;
             self.transcript_task = None;
             self.queue.clear();
             self.queue_task = None;
+            self.presentation_task = None;
+            self.omp_pending.clear();
+            self.omp_status.clear();
+            self.omp_widgets.clear();
+            self.omp_title = None;
         }
         changed
     }
@@ -1612,6 +1637,10 @@ impl AppState {
         }
         if self.context_usage != update.context_usage {
             self.context_usage = update.context_usage;
+            cx.notify();
+        }
+        if self.turn_usage != update.turn_usage {
+            self.turn_usage = update.turn_usage;
             cx.notify();
         }
         Ok(())
@@ -2390,6 +2419,7 @@ impl AppState {
         self.engine = None;
         self.watch_tasks.clear();
         self.transcript_task = None;
+        self.presentation_task = None;
         self.change_request_tasks.clear();
         self.change_requests = ChangeRequestClientState::default();
         self.connection = ConnectionStatus::Connecting;
@@ -2418,6 +2448,7 @@ impl AppState {
         self.transcript_cache.clear();
         self.prepared_transcripts.clear();
         self.context_usage = None;
+        self.turn_usage = None;
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.transcript_replayed = false;
         self.echoes.clear();
@@ -2518,7 +2549,19 @@ impl AppState {
         let Some(handle) = self.engine.clone() else {
             return;
         };
+        // The extension surface belongs to the newly selected chat.
+        self.omp_pending.clear();
+        self.omp_status.clear();
+        self.omp_widgets.clear();
+        self.omp_title = None;
         self.transcript_task = Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+        if handle
+            .engine_info()
+            .supports(zeron_proto::capabilities::OMP_PRESENTATION_V1)
+        {
+            self.presentation_task =
+                Some(spawn_presentation_watch(cx, handle.clone(), chat_id.clone()));
+        }
         if handle
             .engine_info()
             .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
@@ -2650,6 +2693,13 @@ impl AppState {
                 Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
             if handle
                 .engine_info()
+                .supports(zeron_proto::capabilities::OMP_PRESENTATION_V1)
+            {
+                self.presentation_task =
+                    Some(spawn_presentation_watch(cx, handle.clone(), chat_id.clone()));
+            }
+            if handle
+                .engine_info()
                 .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
             {
                 self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
@@ -2743,6 +2793,55 @@ impl AppState {
         self.deep_link_notice.take()
     }
 
+    /// Apply one transient OMP presentation for the selected chat
+    /// (W04). Status/widget/title update the stored surface; notify,
+    /// open-url and editor-text queue as one-shot effects for the
+    /// shell to drain — they must fire once, not on every render.
+    pub fn apply_omp_presentation(&mut self, presentation: zeron_proto::omp::OmpPresentation) {
+        use zeron_proto::omp::OmpPresentation as P;
+        match &presentation {
+            P::Status { key, text } => {
+                self.omp_status.retain(|(k, _)| k != key);
+                if let Some(text) = text {
+                    self.omp_status.push((key.clone(), text.clone()));
+                }
+            }
+            P::Widget { key, lines } => {
+                self.omp_widgets.retain(|(k, _)| k != key);
+                if let Some(lines) = lines {
+                    self.omp_widgets.push((key.clone(), lines.clone()));
+                }
+            }
+            P::Title { title } => self.omp_title = Some(title.clone()),
+            P::Notify { .. } | P::OpenUrl { .. } | P::EditorText { .. } => {
+                self.omp_pending.push(presentation);
+            }
+        }
+    }
+
+    /// Drain queued one-shot OMP presentation effects (W04).
+    pub fn take_omp_presentations(&mut self) -> Vec<zeron_proto::omp::OmpPresentation> {
+        std::mem::take(&mut self.omp_pending)
+    }
+
+    /// The selected chat's extension surface lines (W04): title first,
+    /// then status values, then widget lines — rendered as a slim
+    /// muted strip above the composer. Empty when no extension has
+    /// presented anything for this chat.
+    pub fn omp_surface_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(title) = &self.omp_title {
+            lines.push(title.clone());
+        }
+        lines.extend(self.omp_status.iter().map(|(_, text)| text.clone()));
+        lines.extend(
+            self.omp_widgets
+                .iter()
+                .flat_map(|(_, widget_lines)| widget_lines.iter().cloned()),
+        );
+        lines
+    }
+
     /// Select a chat (or clear). Swaps the per-chat doc-transcript subscription:
     /// dropping the old task drops its stream receiver, which cancels the doc
     /// watch server-side. Selecting a chat also lands in its space and marks it
@@ -2807,6 +2906,7 @@ impl AppState {
                     chat_id: previous.clone(),
                     entries,
                     context_usage: self.context_usage,
+                    turn_usage: self.turn_usage,
                     bytes,
                 });
                 while self.transcript_cache.len() > TRANSCRIPT_CACHE_CAP
@@ -2830,6 +2930,7 @@ impl AppState {
         self.auto_selected = true;
         self.transcript.clear();
         self.context_usage = None;
+        self.turn_usage = None;
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.transcript_replayed = false;
         if let Some(cached) = cached {
@@ -2848,6 +2949,7 @@ impl AppState {
             }
             self.transcript = cached.entries;
             self.context_usage = cached.context_usage;
+            self.turn_usage = cached.turn_usage;
             self.transcript_replayed = true;
         }
         self.transcript_task = None;
@@ -3405,6 +3507,64 @@ fn spawn_queue_watch(
                     // Guard against a stale pump racing a newer selection.
                     if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
                         state.apply_queue(frame.items);
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
+        }
+    })
+}
+
+/// The selected chat's transient OMP presentation stream (W04):
+/// fire-and-forget frames applied to the extension surface and the
+/// shell's one-shot effect queue. No first frame and no replay — a
+/// missed toast is simply missed, like the engine-side stream itself.
+fn spawn_presentation_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    chat_id: String,
+) -> Task<()> {
+    #[derive(serde::Deserialize)]
+    struct PresentationFrame {
+        presentation: zeron_proto::omp::OmpPresentation,
+    }
+    cx.spawn(async move |this, cx| {
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        'resubscribe: loop {
+            let params = serde_json::json!({ "chatId": chat_id });
+            let mut rx = match handle
+                .client()
+                .subscribe_checked(methods::WATCH_OMP_PRESENTATION, params)
+                .await
+            {
+                Ok(rx) => rx,
+                Err(err) => {
+                    tracing::debug!(%chat_id, error = %err, "presentation watch failed; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
+                    continue 'resubscribe;
+                }
+            };
+            while let Some(value) = rx.recv().await {
+                let frame: PresentationFrame = match serde_json::from_value(value) {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "dropping malformed presentation frame");
+                        continue;
+                    }
+                };
+                let alive = this.update(cx, |state, cx| {
+                    if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                        state.apply_omp_presentation(frame.presentation);
                         cx.notify();
                     }
                 });
@@ -4117,6 +4277,7 @@ mod tests {
             let update = |id: &str| zeron_doc::TranscriptUpdate {
                 frame: TranscriptFrame::reset(&[user_entry(id)]),
                 context_usage: None,
+                turn_usage: None,
                 replay_baseline: None,
             };
             state.select_chat(Some("whale".into()), cx);

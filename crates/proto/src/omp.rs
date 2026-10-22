@@ -555,6 +555,174 @@ pub enum OmpPresentation {
     },
 }
 
+/// One provider OMP can authenticate against (W05), as reported by
+/// `get_login_providers`. Discovery only: no credential material ever
+/// rides this type, and Zeron never reads OMP's credential store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OmpLoginProvider {
+    pub id: String,
+    pub name: String,
+    /// The provider can be used at all (configured/reachable upstream).
+    pub available: bool,
+    /// A stored credential currently authenticates this provider.
+    pub authenticated: bool,
+}
+
+/// One stored credential `logout` can remove (W05), as reported by
+/// `get_logout_accounts`. Labels/details only — never secrets.
+/// `kind` is the native token (`api_key`/`oauth`); unknown future
+/// kinds survive as-is rather than being dropped (C1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OmpLogoutAccount {
+    pub credential_id: i64,
+    pub provider: String,
+    pub label: String,
+    pub detail: String,
+    pub kind: String,
+    /// The credential the current session may be using.
+    pub active: bool,
+}
+
+/// Outcome of an OMP `logout` (W05). `remaining_source` names auth
+/// that still applies after removal (e.g. an env-var key), when OMP
+/// reports one; `None` means nothing remains for that provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OmpLogoutOutcome {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_source: Option<String>,
+}
+
+/// Onboarding readiness (W05): can this device run OMP, and is any
+/// provider authenticated so a first session can select a model?
+/// Computed by the owning engine from executable probing plus OMP's
+/// own provider discovery — never from a fabricated static list.
+/// When discovery fails, `providers` is empty and `discovery_error`
+/// carries the actionable cause (missing executable, no selectable
+/// model, …) for the onboarding surface to show verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OmpReadiness {
+    /// Probed `omp --version`, when the executable resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// True when `version` is this build's qualified release.
+    pub qualified: bool,
+    pub providers: Vec<OmpLoginProvider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_error: Option<String>,
+}
+
+impl OmpReadiness {
+    /// A first turn is possible: the runtime is qualified and at
+    /// least one provider is authenticated.
+    pub fn ready_for_first_turn(&self) -> bool {
+        self.qualified && self.providers.iter().any(|p| p.authenticated)
+    }
+}
+
+/// Persistent model-role configuration (W05), read from OMP's
+/// effective config (`modelRoles`, `cycleOrder`,
+/// `retry.fallbackChains`, `defaultThinkingLevel`,
+/// `modelRoleStorage`). This is the persistent layer: assigning a
+/// role here never changes a live session's model — session-only
+/// switching is the composer picker's `OmpSessionConfig` path, and
+/// the two must stay visibly separate. Selectors are kept verbatim
+/// (`provider/model-id`, or `@role` for automatic resolution through
+/// another role); unknown/custom roles survive round-trips (C1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OmpModelRoles {
+    /// Every role the hub offers: OMP's built-ins first, then custom
+    /// roles discovered in assignments/cycle order, de-duplicated.
+    pub roles: Vec<String>,
+    /// Role → selector, only for roles with an explicit assignment.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub assignments: std::collections::BTreeMap<String, String>,
+    /// Ctrl+P-style cycling order over role names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cycle_order: Vec<String>,
+    /// Fallback chains keyed by role, `provider/model-id`, or
+    /// `provider/*`, each an ordered selector list.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub fallback_chains: std::collections::BTreeMap<String, Vec<String>>,
+    /// Persistent default thinking level token, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_thinking_level: Option<String>,
+    /// Where OMP saves role assignments (`global`/`project`), as reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<String>,
+}
+
+/// Model catalog snapshot for the hub (W05): runtime-discovered
+/// descriptors, or the last-known version/profile-scoped cache when
+/// live discovery fails. `stale` + `error` are explicit UI states —
+/// a stale catalog is labeled, never silently presented as live,
+/// and an unavailable one explains itself instead of falling back
+/// to a fabricated static list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OmpCatalogSnapshot {
+    pub models: Vec<OmpModelDescriptor>,
+    pub stale: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Provider usage-limit reports (W05) from `omp usage --json`.
+/// Report internals are provider-shaped and evolve upstream, so
+/// they ride as raw native records (C4-style); Zeron renders the
+/// summary fields it knows and never invents quota numbers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OmpProviderLimits {
+    pub generated_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reports: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts_without_usage: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_credentials: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub capacity: serde_json::Value,
+}
+
+/// State of one non-chat OMP login flow (W05 onboarding): the engine
+/// runs `OmpHarness::login` in the background and surfaces its
+/// browser URL and questions through polling, because a login has
+/// no chat to carry the question bridge. Terminal states are
+/// `done`/`failed`/`cancelled`; an unanswered login is never an
+/// approval of anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OmpLoginStatus {
+    Running,
+    AwaitingInput,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+/// Poll reply for one login flow. `questions` is present exactly in
+/// `awaiting-input`; answers go back through `OmpLoginAnswer` with
+/// the same question ids. `open_url` is the latest browser URL the
+/// flow produced (http/https-gated before it reaches here).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OmpLoginPoll {
+    pub login_id: String,
+    pub provider_id: String,
+    pub status: OmpLoginStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<crate::UserInputQuestion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,6 +848,47 @@ mod tests {
         let legacy = cmd.to_legacy();
         assert_eq!(legacy.name, "plan");
         assert_eq!(legacy.input_hint.as_deref(), Some("<goal>"));
+    }
+
+    #[test]
+    fn readiness_requires_qualified_runtime_and_an_authenticated_provider() {
+        let base = OmpReadiness {
+            version: Some("18.12.5".into()),
+            qualified: true,
+            providers: vec![OmpLoginProvider {
+                id: "anthropic".into(),
+                name: "Anthropic".into(),
+                available: true,
+                authenticated: false,
+            }],
+            discovery_error: None,
+        };
+        assert!(!base.ready_for_first_turn());
+        let mut ready = base.clone();
+        ready.providers[0].authenticated = true;
+        assert!(ready.ready_for_first_turn());
+        // An unqualified runtime never counts, however many logins exist.
+        let mut unqualified = ready.clone();
+        unqualified.qualified = false;
+        assert!(!unqualified.ready_for_first_turn());
+        // Account types round-trip; unknown credential kinds survive.
+        let account = OmpLogoutAccount {
+            credential_id: 7,
+            provider: "anthropic".into(),
+            label: "work".into(),
+            detail: "oauth".into(),
+            kind: "future-kind".into(),
+            active: true,
+        };
+        let json = serde_json::to_value(&account).unwrap();
+        assert_eq!(json["credentialId"], 7);
+        assert_eq!(serde_json::from_value::<OmpLogoutAccount>(json).unwrap(), account);
+        let outcome = OmpLogoutOutcome { remaining_source: None };
+        assert_eq!(
+            serde_json::from_value::<OmpLogoutOutcome>(serde_json::to_value(&outcome).unwrap())
+                .unwrap(),
+            outcome
+        );
     }
 
     #[test]

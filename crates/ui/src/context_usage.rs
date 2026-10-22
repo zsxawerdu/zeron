@@ -147,8 +147,36 @@ fn details(usage: Option<ContextUsage>) -> String {
     }
 }
 
+/// One-line latest-message usage for the footer card (W07):
+/// `12,300 in · 1,240 out · $0.0412` — the cost segment appears
+/// only when the runtime reported one. Pure.
+pub fn turn_usage_line(usage: Option<zeron_proto::TurnUsage>) -> Option<String> {
+    let usage = usage?;
+    if usage.input_tokens == 0 && usage.output_tokens == 0 && usage.cost_usd.is_none() {
+        return None;
+    }
+    let mut line = format!(
+        "{} in · {} out",
+        with_separators(usage.input_tokens),
+        with_separators(usage.output_tokens)
+    );
+    if let Some(cost) = usage.cost_usd {
+        line.push_str(&format!(" · ${cost:.4}"));
+    }
+    Some(line)
+}
+
 /// The context ring's popover content.
 pub fn card(usage: Option<ContextUsage>, theme: &Theme) -> gpui::Div {
+    card_with_turn_usage(usage, None, theme)
+}
+
+/// The context card with the latest message's usage appended (W07).
+pub fn card_with_turn_usage(
+    usage: Option<ContextUsage>,
+    turn_usage: Option<zeron_proto::TurnUsage>,
+    theme: &Theme,
+) -> gpui::Div {
     crate::popover::popover_card(theme)
         .flex()
         .flex_col()
@@ -161,13 +189,43 @@ pub fn card(usage: Option<ContextUsage>, theme: &Theme) -> gpui::Div {
                 .line_height(px(19.0))
                 .whitespace_nowrap()
                 .text_color(theme.text_muted)
-                .child(SharedString::from(details(usage))),
+                .child(SharedString::from(match turn_usage_line(turn_usage) {
+                    Some(line) => format!("{}\nLast message: {line}", details(usage)),
+                    None => details(usage),
+                })),
         )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn turn_usage_line_shows_cost_only_when_reported() {
+        assert_eq!(turn_usage_line(None), None);
+        assert_eq!(
+            turn_usage_line(Some(zeron_proto::TurnUsage {
+                input_tokens: 12_300,
+                output_tokens: 1_240,
+                cost_usd: None,
+            }))
+            .as_deref(),
+            Some("12,300 in · 1,240 out")
+        );
+        assert_eq!(
+            turn_usage_line(Some(zeron_proto::TurnUsage {
+                input_tokens: 5,
+                output_tokens: 2,
+                cost_usd: Some(0.04123),
+            }))
+            .as_deref(),
+            Some("5 in · 2 out · $0.0412")
+        );
+        assert_eq!(
+            turn_usage_line(Some(zeron_proto::TurnUsage::default())),
+            None
+        );
+    }
+
     #[test]
     fn indicator_needs_a_reported_window() {
         assert!(!has_window(None));
